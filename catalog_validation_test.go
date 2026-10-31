@@ -29,13 +29,14 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 				`{"name":"@cf/cloudflare/clef","task":{"name":"Text Generation"}},`+
 				`{"name":"@cf/utter-project/eurollm-9b-it","task":{"name":"Text Generation"}},`+
 				`{"name":"@cf/busy/rate-limited","task":{"name":"Text Generation"}},`+
-				`{"name":"@cf/flaky/server-error","task":{"name":"Text Generation"}}`+
+				`{"name":"@cf/flaky/server-error","task":{"name":"Text Generation"}},`+
+				`{"name":"@cf/meta/llama-guard-3-8b","task":{"name":"Text Generation"}}`+
 				`],"result_info":{"page":1,"total_pages":1}}`)
 			return
 		}
 		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
-		if r.Method != http.MethodPost || r.URL.Path != "/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" || json.Unmarshal(raw, &body) != nil || body["max_tokens"] != float64(1) || body["stream"] != true || r.Header.Get("Authorization") != "Bearer example-key" {
+		if r.Method != http.MethodPost || r.URL.Path != "/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" || json.Unmarshal(raw, &body) != nil || body["max_tokens"] != float64(1) || body["stream"] != false || r.Header.Get("Authorization") != "Bearer example-key" {
 			t.Errorf("bad probe %s %s %s", r.Method, r.URL.Path, raw)
 		}
 		id, _ := body["model"].(string)
@@ -55,17 +56,21 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 			w.WriteHeader(http.StatusTooManyRequests)
 		case "@cf/flaky/server-error":
 			w.WriteHeader(http.StatusInternalServerError)
+		case "@cf/meta/llama-guard-3-8b": // live: 400 for stream=true, serves stream=false
+			if body["stream"] == true {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"\n"},"finish_reason":"stop"}]}`)
 		default:
-			w.Header().Set("Content-Type", "text/event-stream")
-			io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"p\"}}]}\n\n")
-			w.(http.Flusher).Flush()
-			<-r.Context().Done() // the probe must cancel instead of reading the generation
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
 		}
 	}))
 	defer server.Close()
 	c := newCatalog()
 	req := pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
-	want := "cloudflare/@cf/ok/alive,cloudflare/@cf/busy/rate-limited,cloudflare/@cf/flaky/server-error"
+	want := "cloudflare/@cf/ok/alive,cloudflare/@cf/busy/rate-limited,cloudflare/@cf/flaky/server-error,cloudflare/@cf/meta/llama-guard-3-8b"
 	start := time.Now()
 	for round := 0; round < 2; round++ {
 		out, err := c.ModelsForAuth(context.Background(), req)
@@ -81,7 +86,7 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	for id, n := range map[string]int{"@cf/ok/alive": 1, "@cf/swiss-ai/apertus-v1.5-8b": 1, "@cf/meta/llama-3.2-11b-vision-instruct": 1, "@cf/cloudflare/clef": 1, "@cf/utter-project/eurollm-9b-it": 1, "@cf/busy/rate-limited": 2, "@cf/flaky/server-error": 2} {
+	for id, n := range map[string]int{"@cf/ok/alive": 1, "@cf/swiss-ai/apertus-v1.5-8b": 1, "@cf/meta/llama-3.2-11b-vision-instruct": 1, "@cf/cloudflare/clef": 1, "@cf/utter-project/eurollm-9b-it": 1, "@cf/busy/rate-limited": 2, "@cf/flaky/server-error": 2, "@cf/meta/llama-guard-3-8b": 1} {
 		if probes[id] != n {
 			t.Errorf("%s probed %d times, want %d", id, probes[id], n)
 		}

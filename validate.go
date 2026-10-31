@@ -69,23 +69,20 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 	return out, nil
 }
 
-// probeModel sends a one-token streaming chat request and decides on the
-// response status alone; the stream is cancelled as soon as headers arrive.
+// probeModel sends a one-token NON-streaming chat request and decides on the
+// response status. Non-streaming is deliberate: some models accept only
+// stream=false (live: @cf/meta/llama-guard-3-8b answers stream=true with 400
+// "Invalid input" but serves stream=false), and a one-token reply is immediate.
 // 400/422 mean the model rejects a minimal chat request; 403/404/410 mean the
 // account may not use it. 2xx proves it is usable. Anything else (429, 5xx,
 // timeouts) is inconclusive and keeps the model.
 func probeModel(ctx context.Context, client pluginapi.HostHTTPClient, cred credentials, id string) (usable, definitive bool) {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}}, "max_tokens": 1, "stream": true})
-	resp, err := client.DoStream(pctx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: accountBase(cred) + "/v1/chat/completions", Headers: http.Header{"Authorization": {"Bearer " + cred.token}, "Content-Type": {"application/json"}, "Accept": {"text/event-stream"}}, Body: body})
+	body, _ := json.Marshal(map[string]any{"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}}, "max_tokens": 1, "stream": false})
+	resp, err := client.Do(pctx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: accountBase(cred) + "/v1/chat/completions", Headers: http.Header{"Authorization": {"Bearer " + cred.token}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}, Body: body})
 	if err != nil {
 		return true, false
-	}
-	cancel() // only the status was needed
-	if resp.Chunks != nil {
-		for range resp.Chunks {
-		}
 	}
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusForbidden, http.StatusNotFound, http.StatusGone:

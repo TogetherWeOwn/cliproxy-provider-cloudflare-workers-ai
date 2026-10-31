@@ -75,8 +75,10 @@ The catalog is public, not per-account availability: in a live check on
 2026-10-31, 7 of 39 listed text-generation models failed a minimal chat request
 for one account (403 not allowed for the account, 403 license agreement not yet
 accepted, 400 non-chat input schema, 400 model has no config). Discovered and
-fallback IDs are therefore **validated per account** with a one-token streaming
-chat probe (`max_tokens: 1`, cancelled when headers arrive):
+fallback IDs are therefore **validated per account** with a one-token
+non-streaming chat probe (`max_tokens: 1`; non-streaming because some models,
+e.g. `@cf/meta/llama-guard-3-8b`, reject `stream: true` but serve requests
+without it):
 
 - 400, 403, 404, 410 or 422: not advertised for this account.
 - 2xx: advertised. 429, 5xx, timeouts and transport errors are inconclusive and
