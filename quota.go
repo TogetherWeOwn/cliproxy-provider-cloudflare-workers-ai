@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
@@ -36,8 +37,12 @@ type httpDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// newAnalyticsClient follows the proxy that the kit's CachedQuota attaches to
+// each poll: the auth's proxy_url, else the host's global proxy-url.
 func newAnalyticsClient() *http.Client {
-	return &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(), Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = kit.QuotaProxy
+	return &http.Client{Transport: transport, Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 func analyticsError(code, message string) *pluginabi.Error {
 	return &pluginabi.Error{Code: code, Message: message, HTTPStatus: 502}

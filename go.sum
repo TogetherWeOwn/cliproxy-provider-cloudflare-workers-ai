@@ -1,5 +1,5 @@
-github.com/TogetherWeOwn/cliproxy-provider-kit v0.1.0 h1:AQFqjYDnluUxfJ5nUrRD/8rXMWB0noOx+BG+GYh8gB4=
-github.com/TogetherWeOwn/cliproxy-provider-kit v0.1.0/go.mod h1:JyGKAfqbSPvtv6ARDUc1KiaP2d8bMD42dzQH4XOcJdI=
+github.com/TogetherWeOwn/cliproxy-provider-kit v0.1.1-0.20261031223456-f24cf1f94005 h1:w8slG9EZEPmhs//4+m9Rxqy21816g1RkbWyCY4QLgC8=
+github.com/TogetherWeOwn/cliproxy-provider-kit v0.1.1-0.20261031223456-f24cf1f94005/go.mod h1:JyGKAfqbSPvtv6ARDUc1KiaP2d8bMD42dzQH4XOcJdI=
 github.com/router-for-me/CLIProxyAPI/v8 v8.0.48 h1:6nGbSk3c4oncbpHKs+Hq0excZ8sMxZHiHdcUrtp29TM=
 github.com/router-for-me/CLIProxyAPI/v8 v8.0.48/go.mod h1:PCYpdU5+5Sg+BxCGqi81TnSYpppzDaqe5ryH+Z+gJ64=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
