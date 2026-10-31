@@ -82,7 +82,8 @@ func TestRealHostLoader(t *testing.T) {
 				t.Error("bad inference auth")
 			}
 			var body map[string]any
-			if json.NewDecoder(r.Body).Decode(&body) != nil || body["model"] != "@cf/meta/llama-3.1-8b-instruct-fp8" {
+			// Discovery validates each catalog model with a one-token chat probe.
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body["model"] != "@cf/meta/llama-3.1-8b-instruct-fp8" && !(body["model"] == "@cf/qwen/qwen3-30b-a3b-fp8" && body["max_tokens"] == float64(1)) {
 				t.Error("prefix not stripped")
 				w.WriteHeader(400)
 				return
@@ -162,7 +163,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.0" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.1" {
 		t.Fatalf("metadata %+v", info)
 	}
 	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
@@ -332,7 +333,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.0" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.1" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }

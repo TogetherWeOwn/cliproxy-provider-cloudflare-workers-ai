@@ -69,8 +69,24 @@ record and makes no upstream call.
 Discovery uses the official `GET /client/v4/accounts/{account_id}/ai/models/search`
 with `task=Text Generation`, `page` and `per_page=100`. Results are bounded to 20
 pages, deduplicated, and filtered to supported text-generation model names.
-Unavailable/malformed discovery falls back to a small static catalog. A fallback
-entry is not proof of entitlement or current model availability.
+Unavailable/malformed discovery falls back to a small static catalog.
+
+The catalog is public, not per-account availability: in a live check on
+2026-10-31, 7 of 39 listed text-generation models failed a minimal chat request
+for one account (403 not allowed for the account, 403 license agreement not yet
+accepted, 400 non-chat input schema, 400 model has no config). Discovered and
+fallback IDs are therefore **validated per account** with a one-token streaming
+chat probe (`max_tokens: 1`, cancelled when headers arrive):
+
+- 400, 403, 404, 410 or 422: not advertised for this account.
+- 2xx: advertised. 429, 5xx, timeouts and transport errors are inconclusive and
+  keep the model, so a transient problem never empties the catalog.
+- At most 8 probes run at once, each bounded to 10 s, the whole validation to
+  30 s. Definitive verdicts are cached per account/token digest for 6 h;
+  inconclusive models are re-probed on the next discovery.
+- Probes use a negligible number of neurons. The plugin never submits a model
+  license agreement (`agree`) on the operator's behalf; accept it yourself and
+  the model is advertised after the cached verdict expires or the plugin reloads.
 
 Every registered/discovered model gets the fixed **`cloudflare/`** namespace.
 The executor strips exactly that leading prefix, preserving the upstream's
@@ -196,7 +212,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.0_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.1.1_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.

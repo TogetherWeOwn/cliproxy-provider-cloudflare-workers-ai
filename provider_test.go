@@ -140,6 +140,11 @@ func TestRawHTTPIsPinnedAndInvalidModelsRejected(t *testing.T) {
 func TestDiscoveryUsesSearchPaginationAndNamespacesChatOnly(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" { // validation probe
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
 		calls.Add(1)
 		if r.URL.Path != "/client/v4/accounts/"+testAccount+"/ai/models/search" || r.URL.Query().Get("task") != "Text Generation" || r.Header.Get("Authorization") != "Bearer example-key" || r.URL.Query().Get("per_page") != "100" {
 			t.Error("invalid discovery wire request")
@@ -151,15 +156,15 @@ func TestDiscoveryUsesSearchPaginationAndNamespacesChatOnly(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	out, err := (catalog{}).ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
+	out, err := newCatalog().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
 	if err != nil || len(out.Models) != 2 || calls.Load() != 2 {
 		t.Fatalf("discovery models=%d calls=%d err=%v", len(out.Models), calls.Load(), err)
 	}
 	if out.Models[0].ID != "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8" || out.Models[1].ID != "cloudflare/@cf/qwen/qwen3-30b-a3b-fp8" {
 		t.Fatal("incorrect model IDs")
 	}
-	static, _ := (catalog{}).StaticModels(context.Background(), pluginapi.StaticModelRequest{})
-	reg, _ := (catalog{}).RegisterModels(context.Background(), pluginapi.ModelRegistrationRequest{})
+	static, _ := newCatalog().StaticModels(context.Background(), pluginapi.StaticModelRequest{})
+	reg, _ := newCatalog().RegisterModels(context.Background(), pluginapi.ModelRegistrationRequest{})
 	if len(static.Models) < 2 || len(reg.Models) != len(static.Models) {
 		t.Fatal("no static fallback")
 	}
@@ -172,7 +177,7 @@ func TestDiscoveryUsesSearchPaginationAndNamespacesChatOnly(t *testing.T) {
 func TestDiscoveryFailureFallsBackWithoutFabricatingEntitlements(t *testing.T) {
 	for _, raw := range []string{`{"success":false,"errors":[{"message":"example-secret"}]}`, `{}`, `{"success":true,"result":null}`, strings.Repeat("x", (1<<20)+1)} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, raw) }))
-		out, err := (catalog{}).ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
+		out, err := newCatalog().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
 		server.Close()
 		if err != nil || len(out.Models) < 2 {
 			t.Fatalf("static fallback failed %v", err)

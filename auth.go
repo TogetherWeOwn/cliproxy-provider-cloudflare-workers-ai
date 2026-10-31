@@ -17,7 +17,7 @@ import (
 
 const (
 	provider            = "cloudflare-workers-ai"
-	version             = "0.1.0"
+	version             = "0.1.1"
 	modelPrefix         = "cloudflare/"
 	upstreamBase        = "https://api.cloudflare.com"
 	defaultDailyNeurons = 10000.0
