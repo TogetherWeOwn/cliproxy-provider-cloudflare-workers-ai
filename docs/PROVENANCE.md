@@ -22,6 +22,6 @@ The C-ABI wiring, host-compatibility harness layout, release packaging, CI and
 document structure follow the sibling
 [cliproxy-provider-synthetic](https://github.com/TogetherWeOwn/cliproxy-provider-synthetic)
 v0.1.0 and the published
-[cliproxy-provider-kit](https://github.com/TogetherWeOwn/cliproxy-provider-kit) v0.1.0 (now pinned at `f24cf1f`).
+[cliproxy-provider-kit](https://github.com/TogetherWeOwn/cliproxy-provider-kit) v0.1.0 (now pinned at `de8b318`).
 Auth, model discovery, executor and quota-provider code in this repository is
 new. The MIT license is included at the repository root and in release archives.

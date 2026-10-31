@@ -2,7 +2,7 @@
 
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, and a **daily neuron quota card**. Uses the
-[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `f24cf1f`
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `de8b318`
 and the real **CLIProxyAPI v8.0.48** C-ABI loader (ABI 1, RPC schema 9).
 
 Multiple auth files use native routing (`round-robin`, weighted routing or
