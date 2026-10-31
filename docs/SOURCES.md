@@ -2,9 +2,12 @@
 
 Retrieved 2026-10-31. Official Cloudflare documentation is the authority for
 every endpoint, header, limit and error code below. Where official docs are
-silent, the row says so and names the weaker evidence actually used. Nothing
-here was established by calling a live Cloudflare inference, model, quota or
-analytics endpoint; all repository tests use loopback `httptest` mocks.
+silent, the row says so and names the weaker evidence actually used. The wire
+rows below were not established by calling a live Cloudflare endpoint, and all
+repository tests use loopback `httptest` mocks. The only live observations are
+the dated catalog-availability measurements in the README ("Models and
+execution", 2026-10-31, one account, via a staging host): they motivate the
+per-account validation probe and are not guarantees.
 
 ## Inference
 

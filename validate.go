@@ -32,7 +32,10 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 	defer cancel()
 	digest := sha256.Sum256([]byte(cred.account + "\x00" + cred.token))
 	alive := make([]bool, len(candidates))
-	sem := make(chan struct{}, probeConcurrency)
+	sem := c.probes
+	if sem == nil {
+		sem = make(chan struct{}, probeConcurrency)
+	}
 	var wg sync.WaitGroup
 	for i, m := range candidates {
 		id := strings.TrimPrefix(m.ID, modelPrefix)
@@ -127,8 +130,20 @@ func (c *verdictCache) put(digest [32]byte, id string, usable bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := c.now()
+	// Prune expired entries so rotated tokens do not accumulate verdicts.
+	for d, entries := range c.m {
+		for model, v := range entries {
+			if !now.Before(v.expires) {
+				delete(entries, model)
+			}
+		}
+		if len(entries) == 0 {
+			delete(c.m, d)
+		}
+	}
 	if c.m[digest] == nil {
 		c.m[digest] = make(map[string]verdict)
 	}
-	c.m[digest][id] = verdict{usable: usable, expires: c.now().Add(verdictTTL)}
+	c.m[digest][id] = verdict{usable: usable, expires: now.Add(verdictTTL)}
 }

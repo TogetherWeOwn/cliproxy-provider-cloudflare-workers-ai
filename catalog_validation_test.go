@@ -123,6 +123,10 @@ func TestVerdictCacheExpires(t *testing.T) {
 	if _, ok := c.get(digest, "m"); ok {
 		t.Fatal("expired verdict reused")
 	}
+	c.put([32]byte{1}, "other", true) // writes prune expired entries
+	if _, kept := c.m[digest]; kept {
+		t.Fatal("expired verdicts not pruned")
+	}
 }
 
 func ids(models []pluginapi.ModelInfo) string {
@@ -131,4 +135,49 @@ func ids(models []pluginapi.ModelInfo) string {
 		out = append(out, m.ID)
 	}
 	return strings.Join(out, ",")
+}
+
+// Overlapping discoveries share one probe limit.
+func TestConcurrentDiscoveriesShareTheProbeLimit(t *testing.T) {
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	var names []string
+	for i := 0; i < 3*probeConcurrency; i++ {
+		names = append(names, `{"name":"@cf/org/m`+string(rune('a'+i))+`","task":{"name":"Text Generation"}}`)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
+			io.WriteString(w, `{"success":true,"errors":[],"result":[`+strings.Join(names, ",")+`],"result_info":{"page":1,"total_pages":1}}`)
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
+	}))
+	defer server.Close()
+	c := newCatalog()
+	var wg sync.WaitGroup
+	for _, key := range []string{"key-one", "key-two"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out, err := c.ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, key), HTTPClient: mockHostClient{server}})
+			if err != nil || len(out.Models) != len(names) {
+				t.Errorf("discovery %d %v", len(out.Models), err)
+			}
+		}()
+	}
+	wg.Wait()
+	if peak > probeConcurrency {
+		t.Fatalf("peak concurrent probes %d > %d", peak, probeConcurrency)
+	}
 }

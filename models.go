@@ -13,9 +13,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-type catalog struct{ cache *verdictCache }
+type catalog struct {
+	cache *verdictCache
+	// probes is shared by every discovery so overlapping ModelsForAuth calls
+	// stay within probeConcurrency in total.
+	probes chan struct{}
+}
 
-func newCatalog() catalog { return catalog{cache: newVerdictCache()} }
+func newCatalog() catalog {
+	return catalog{cache: newVerdictCache(), probes: make(chan struct{}, probeConcurrency)}
+}
 
 func modelInfo(id string) pluginapi.ModelInfo {
 	return pluginapi.ModelInfo{ID: modelPrefix + id, Object: "model", OwnedBy: provider, DisplayName: id}

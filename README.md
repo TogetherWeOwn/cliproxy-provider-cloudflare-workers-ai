@@ -83,7 +83,7 @@ without it):
 - 400, 403, 404, 410 or 422: not advertised for this account.
 - 2xx: advertised. 429, 5xx, timeouts and transport errors are inconclusive and
   keep the model, so a transient problem never empties the catalog.
-- At most 8 probes run at once, each bounded to 10 s, the whole validation to
+- At most 8 probes run at once across all discoveries, each bounded to 10 s, the whole validation to
   30 s. Definitive verdicts are cached per account/token digest for 6 h;
   inconclusive models are re-probed on the next discovery.
 - Probes use a negligible number of neurons. The plugin never submits a model
