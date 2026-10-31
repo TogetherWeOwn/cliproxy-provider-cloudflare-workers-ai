@@ -38,11 +38,10 @@ type httpDoer interface {
 }
 
 // newAnalyticsClient follows the proxy that the kit's CachedQuota attaches to
-// each poll: the auth's proxy_url, else the host's global proxy-url.
+// each poll: the auth's proxy_url, else the host's global proxy-url. The kit
+// transport keeps pooled connections from crossing proxies.
 func newAnalyticsClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = kit.QuotaProxy
-	return &http.Client{Transport: transport, Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return &http.Client{Transport: kit.NewQuotaTransport(), Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 func analyticsError(code, message string) *pluginabi.Error {
 	return &pluginabi.Error{Code: code, Message: message, HTTPStatus: 502}

@@ -46,3 +46,12 @@ func TestAnalyticsPollUsesAuthOrHostProxy(t *testing.T) {
 		t.Fatalf("host proxy saw %v", got)
 	}
 }
+
+// HTTP/2 connections are reused by destination before the proxy is chosen, so
+// a transport shared across auths must not speak HTTP/2.
+func TestQuotaTransportDoesNotShareConnectionsAcrossProxies(t *testing.T) {
+	transport, ok := newAnalyticsClient().Transport.(*http.Transport)
+	if !ok || transport.Proxy == nil || transport.Protocols == nil || transport.Protocols.HTTP2() || !transport.Protocols.HTTP1() {
+		t.Fatal("quota transport must be HTTP/1.1-only with a proxy function")
+	}
+}
