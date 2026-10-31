@@ -2,7 +2,7 @@
 
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, and a **daily neuron quota card**. Uses the
-published [`cliproxy-provider-kit` v0.1.0](https://github.com/TogetherWeOwn/cliproxy-provider-kit)
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `f24cf1f`
 and the real **CLIProxyAPI v8.0.48** C-ABI loader (ABI 1, RPC schema 9).
 
 Multiple auth files use native routing (`round-robin`, weighted routing or
@@ -151,7 +151,8 @@ fields, partial GraphQL errors, oversized bodies and permission errors fail
 closed for the card. An explicit empty dataset means no measured usage.
 
 GraphQL polling has a 15-second timeout, 1 MiB body cap, no redirects, redacted
-errors and no inference side effects. Kit v0.1.0's quota helper only supports
+errors and no inference side effects. It goes through the auth's `proxy_url`, else the
+host's global `proxy-url`, like inference. Kit v0.1.0's quota helper only supports
 GET, so this provider uses an equivalent bounded client for GraphQL POST.
 Adaptive analytics can be sampled/delayed and other account consumers may exist.
 **This display cannot enforce free-only billing on a Workers Paid account.**
