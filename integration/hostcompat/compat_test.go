@@ -1,0 +1,338 @@
+//go:build cgo && (linux || darwin || freebsd)
+
+// Harness layout adapted from cliproxy-provider-synthetic v0.1.0 (MIT).
+package hostcompat
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	translator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"gopkg.in/yaml.v3"
+)
+
+const provider = "cloudflare-workers-ai"
+const model = "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"
+
+var account = strings.Repeat("a", 32)
+
+type executors map[string]coreauth.ProviderExecutor
+
+func (m executors) Executor(p string) (coreauth.ProviderExecutor, bool) { e, ok := m[p]; return e, ok }
+func (m executors) RegisterExecutor(e coreauth.ProviderExecutor)        { m[e.Identifier()] = e }
+func (m executors) UnregisterExecutor(p string)                         { delete(m, p) }
+
+type models struct{}
+
+func (models) RegisterClient(string, string, []*registry.ModelInfo) {}
+func (models) UnregisterClient(string)                              {}
+func (models) GetModelProviders(string) []string                    { return nil }
+func authJSON(key string) []byte {
+	raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": account, "api_key": key, "analytics_api_key": "analytics-key", "label": "Example"})
+	return raw
+}
+
+// Real v8.0.48 dlopen, C-ABI registration, RPC dispatch, auth persistence and
+// executor adapters. The only provider network target is an httptest server.
+func TestRealHostLoader(t *testing.T) {
+	var polls atomic.Int32
+	gate := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/client/v4/graphql":
+			polls.Add(1)
+			if r.Method != "POST" || r.Header.Get("Authorization") != "Bearer analytics-key" {
+				t.Error("bad analytics request")
+			}
+			var wire struct {
+				Query     string
+				Variables map[string]string
+			}
+			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account || !strings.Contains(wire.Query, "totalNeurons") {
+				t.Error("bad GraphQL query")
+			}
+			io.WriteString(w, `{"data":{"viewer":{"accounts":[{"accountTag":"`+account+`","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":7500}}]}]}}}`)
+		case "/client/v4/accounts/" + account + "/ai/models/search":
+			if r.Header.Get("Authorization") != "Bearer example-key" || r.URL.Query().Get("task") != "Text Generation" {
+				t.Error("bad discovery request")
+			}
+			io.WriteString(w, `{"success":true,"errors":[],"result":[{"name":"@cf/meta/llama-3.1-8b-instruct-fp8","task":{"name":"Text Generation"}},{"name":"@cf/qwen/qwen3-30b-a3b-fp8","task":{"name":"Text Generation"}}],"result_info":{"page":1,"total_pages":1}}`)
+		case "/client/v4/accounts/" + account + "/ai/v1/chat/completions":
+			token := r.Header.Get("Authorization")
+			if token != "Bearer example-key" && token != "Bearer second-key" {
+				t.Error("bad inference auth")
+			}
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body["model"] != "@cf/meta/llama-3.1-8b-instruct-fp8" {
+				t.Error("prefix not stripped")
+				w.WriteHeader(400)
+				return
+			}
+			if status, ok := body["fixture_status"].(float64); ok && !(body["fixture_first_only"] == true && token == "Bearer second-key") {
+				if status == 429 {
+					w.Header().Set("Retry-After", "7")
+				}
+				w.WriteHeader(int(status))
+				if body["fixture_daily"] == true {
+					io.WriteString(w, `{"errors":[{"code":3036,"message":"daily neuron allocation exhausted"}]}`)
+				} else if status == 429 {
+					io.WriteString(w, `{"errors":[{"code":3040,"message":"Capacity temporarily exceeded"}]}`)
+				} else {
+					io.WriteString(w, `{"error":"fixture failure"}`)
+				}
+				return
+			}
+			if body["stream"] == true {
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, "data: {\"id\":\"chat-example\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
+				w.(http.Flusher).Flush()
+				if body["fixture_gate"] == true {
+					select {
+					case <-gate:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"chat-example","object":"chat.completion","model":"@cf/meta/llama-3.1-8b-instruct-fp8","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+		default:
+			t.Errorf("unexpected provider path %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	arch := filepath.Join(dir, runtime.GOOS, runtime.GOARCH)
+	if err = os.MkdirAll(arch, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ext := ".so"
+	if runtime.GOOS == "darwin" {
+		ext = ".dylib"
+	}
+	lib := filepath.Join(arch, provider+ext)
+	build := exec.Command("go", "build", "-tags=hostcompat", "-buildmode=c-shared", "-o", lib, ".")
+	build.Dir = root
+	build.Env = append(os.Environ(), "CGO_ENABLED=1")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("c-shared build: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("nm", "-D", lib).CombinedOutput(); err != nil || !strings.Contains(string(out), " T cliproxy_plugin_init") {
+		t.Fatalf("entry point %v\n%s", err, out)
+	}
+	enabled := true
+	var raw yaml.Node
+	if err = yaml.Unmarshal([]byte("enabled: true\nhostcompat_base: "+server.URL+"\n"), &raw); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{AuthDir: t.TempDir(), Plugins: config.PluginsConfig{Enabled: true, Dir: dir, Configs: map[string]config.PluginInstanceConfig{provider: {Enabled: &enabled, Raw: *raw.Content[0]}}}}
+	host := pluginhost.New()
+	defer host.ShutdownAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ctx = logging.WithResponseHeadersHolder(ctx)
+	host.ApplyConfig(ctx, cfg)
+	if !host.PluginLoaded(provider) || !host.PluginRegistered(provider) || !host.HasAuthProvider(provider) || !host.HasQuotaProvider(provider) {
+		t.Fatalf("registration %+v", host.RegisteredPlugins())
+	}
+	info := host.RegisteredPlugins()
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.0" {
+		t.Fatalf("metadata %+v", info)
+	}
+	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
+	if err != nil || !handled || auth == nil {
+		t.Fatalf("auth %v %v", handled, err)
+	}
+	if _, _, err = host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "duplicate.json", RawJSON: authJSON("example-key")}); err == nil {
+		t.Fatal("duplicate accepted")
+	}
+	file := filepath.Join(cfg.AuthDir, "example.json")
+	if err = auth.Storage.SaveTokenToFile(file); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if json.Unmarshal(saved, &fields) != nil || fields["type"] != provider || fields["account_id"] != account || fields["label"] != "Example" {
+		t.Fatal("storage merge failed")
+	}
+	quotaReq := pluginapi.QuotaFetchRequest{AuthID: auth.ID, Provider: provider, StorageJSON: saved}
+	for i := 0; i < 2; i++ {
+		quota, handled, err := host.FetchQuota(ctx, quotaReq)
+		if err != nil || !handled || len(quota.Groups) != 1 || quota.Groups[0].Buckets[0].RemainingFraction != .25 || quota.Groups[0].Buckets[0].Window != "daily" || polls.Load() != 1 {
+			t.Fatalf("quota %+v %v polls=%d", quota, err, polls.Load())
+		}
+	}
+	m := executors{}
+	host.RegisterModels(ctx, models{})
+	host.RegisterExecutors(m, models{})
+	static := host.ModelsForProvider(provider)
+	if len(static) < 2 {
+		t.Fatal("no static fallback")
+	}
+	for _, m := range static {
+		if !strings.HasPrefix(m.ID, "cloudflare/") {
+			t.Fatal("unprefixed static model")
+		}
+	}
+	found := host.ModelsForAuth(ctx, auth)
+	if !found.Handled || len(found.Models) != 2 {
+		t.Fatalf("discovery %+v", found)
+	}
+	for _, m := range found.Models {
+		if !strings.HasPrefix(m.ID, "cloudflare/") {
+			t.Fatal("unprefixed discovered model")
+		}
+	}
+	ex, ok := m[provider]
+	if !ok {
+		t.Fatal("no executor")
+	}
+	opts := coreexec.Options{SourceFormat: translator.FormatOpenAI, ResponseFormat: translator.FormatOpenAI}
+	req := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hello"}]}`)}
+	resp, err := ex.Execute(ctx, auth, req, opts)
+	if err != nil || !strings.Contains(string(resp.Payload), `"content":"hello"`) || !strings.Contains(string(resp.Payload), `"total_tokens":5`) {
+		t.Fatalf("execute %s %v", resp.Payload, err)
+	}
+	req.Payload = []byte(`{"model":"` + model + `","fixture_gate":true,"messages":[{"role":"user","content":"hello"}]}`)
+	opts.Stream = true
+	stream, err := ex.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunks strings.Builder
+	select {
+	case c := <-stream.Chunks:
+		if c.Err != nil || len(c.Payload) == 0 {
+			t.Fatalf("first chunk %+v", c)
+		}
+		chunks.Write(c.Payload)
+		close(gate)
+	case <-ctx.Done():
+		t.Fatal("stream buffered")
+	}
+	for c := range stream.Chunks {
+		if c.Err != nil {
+			t.Fatal(c.Err)
+		}
+		chunks.Write(c.Payload)
+	}
+	if !strings.Contains(chunks.String(), "[DONE]") {
+		t.Fatal("stream truncated")
+	}
+	opts.Stream = false
+	for _, status := range []int{401, 403, 404, 429, 503} {
+		raw, _ := json.Marshal(map[string]any{"model": model, "fixture_status": status})
+		req.Payload = raw
+		_, err = ex.Execute(ctx, auth, req, opts)
+		e, ok := err.(interface{ StatusCode() int })
+		if !ok || e.StatusCode() != status {
+			t.Fatalf("status %d: %T %v", status, err, err)
+		}
+		if status == 429 {
+			hint, ok := err.(interface{ RetryAfter() *time.Duration })
+			if !ok || hint.RetryAfter() == nil || *hint.RetryAfter() != 7*time.Second {
+				t.Fatal("rate Retry-After lost")
+			}
+		}
+	}
+	t.Run("daily exhaustion rotates only failed auth until UTC reset", func(t *testing.T) {
+		second, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "second.json", RawJSON: authJSON("second-key")})
+		if err != nil || !handled || second == nil {
+			t.Fatal(err)
+		}
+		mgr := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+		mgr.SetRetryConfig(0, 0, 2)
+		mgr.RegisterExecutor(ex)
+		first := auth.Clone()
+		first.ID = "first-auth"
+		first.Status = coreauth.StatusActive
+		first.Attributes = map[string]string{"type": "api_key", "priority": "10"}
+		second = second.Clone()
+		second.ID = "second-auth"
+		second.Status = coreauth.StatusActive
+		for _, a := range []*coreauth.Auth{first, second} {
+			if _, err = mgr.Register(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+			registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
+		}
+		before := time.Now().UTC()
+		reset := time.Date(before.Year(), before.Month(), before.Day()+1, 0, 0, 0, 0, time.UTC)
+		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","fixture_status":429,"fixture_daily":true,"fixture_first_only":true}`)}
+		if _, err = mgr.Execute(ctx, []string{provider}, call, opts); err != nil {
+			t.Fatalf("sibling rotation %v", err)
+		}
+		failed, _ := mgr.GetByID(first.ID)
+		healthy, _ := mgr.GetByID(second.ID)
+		state := failed.ModelStates[model]
+		if state == nil || !state.Quota.Exceeded || state.NextRetryAfter.Before(reset) || state.NextRetryAfter.After(reset.Add(3*time.Second)) {
+			t.Fatalf("UTC reset hint lost %+v", state)
+		}
+		if healthy.Unavailable || healthy.Quota.Exceeded {
+			t.Fatal("healthy sibling impaired")
+		}
+	})
+	t.Run("pinned host transient 429 marker limitation", func(t *testing.T) {
+		mgr := coreauth.NewManager(nil, nil, nil)
+		mgr.SetRetryConfig(0, 0, 1)
+		mgr.RegisterExecutor(ex)
+		one := auth.Clone()
+		one.ID = "transient-auth"
+		one.Status = coreauth.StatusActive
+		if _, err = mgr.Register(ctx, one); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(one.ID, one.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(one.ID) })
+		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","fixture_status":429}`)}, opts)
+		if err == nil {
+			t.Fatal("rate failure disappeared")
+		}
+		got, _ := mgr.GetByID(one.ID)
+		state := got.ModelStates[model]
+		if state == nil || !state.Quota.Exceeded {
+			t.Fatalf("host changed; revisit documented RPC limitation %+v", state)
+		}
+		t.Log("v8.0.48 RPC drops the transient marker; rate/capacity 429 is marked model quota-exceeded")
+	})
+}
+func TestRegistryUsesNativeStoreSchema(t *testing.T) {
+	raw, err := os.ReadFile("../../registry.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := pluginstore.ParseRegistry(raw)
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.0" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+		t.Fatalf("registry %+v %v", reg, err)
+	}
+}

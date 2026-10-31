@@ -1,0 +1,53 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: |
+            go.sum
+            integration/hostcompat/go.sum
+      - name: Build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y gcc binutils zip
+      - name: Isolated scratch directory
+        run: |
+          mkdir -p "$HOME/.cache"
+          echo "TMPDIR=$(mktemp -d "$HOME/.cache/cloudflare-ci.XXXXXX")" >> "$GITHUB_ENV"
+      - name: Formatting
+        run: test -z "$(gofmt -l $(git ls-files '*.go') $(git ls-files --others --exclude-standard '*.go'))"
+      - name: Vet
+        run: |
+          go vet ./...
+          go -C integration/hostcompat vet ./...
+      - name: Race tests and release contract
+        run: go test -race -count=1 ./...
+      - name: Real v8.0.48 host loader compatibility
+        run: go -C integration/hostcompat test -race -count=1 ./...
+      - name: Production archive, ABI entry point and glibc floor
+        run: bash scripts/package-release.sh dist
+      - name: Secret scan
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.24.3
+          gitleaks dir --redact --no-banner .
+          python3 -I scripts/check-public-files.py .
+      - name: Release candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-workers-ai-linux-amd64
+          path: |
+            dist/cloudflare-workers-ai_*_linux_amd64.zip
+            dist/checksums.txt
+      - name: Remove scratch directory
+        if: always()
+        run: |
+          if [[ -n "${TMPDIR:-}" && "$TMPDIR" == "$HOME/.cache/cloudflare-ci."* ]]; then rm -rf -- "$TMPDIR"; fi
