@@ -151,9 +151,10 @@ func TestAPIKeyLoginSameTokenTwoAccounts(t *testing.T) {
 	if files != 2 || owners != 2 {
 		t.Fatalf("ownership entries lost: files=%d owners=%d, want 2/2", files, owners)
 	}
-	// Re-login of the first identity stays idempotent: same filename, no
-	// duplicate_auth, no extra ownership entry.
-	again := loginOnce(t, p, testAccount)
+	// Re-login of the first identity stays idempotent, including under a
+	// mixed-case spelling of the account (credentialsFields canonicalizes
+	// to lowercase): same filename, no duplicate_auth, no extra entry.
+	again := loginOnce(t, p, strings.ToUpper(testAccount))
 	if again.FileName != first.FileName || again.ID != first.ID {
 		t.Fatalf("re-login not idempotent: %+v vs %+v", again, first)
 	}
