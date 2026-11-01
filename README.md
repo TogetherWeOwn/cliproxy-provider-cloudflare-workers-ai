@@ -3,8 +3,9 @@
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, a **daily neuron quota card** and a
 **free-only hard stop** that is on by default. Uses the
-[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `de8b318`
-and the real **CLIProxyAPI v8.0.48** C-ABI loader (ABI 1, RPC schema 9).
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `c81b686`
+and the real **CLIProxyAPI v8.0.48** C-ABI loader (ABI 1, RPC schema 9). The kit refuses only older hosts, so newer hosts such as
+v8.0.49 (RPC schema 10) also load it.
 
 Multiple auth files use native routing (`round-robin`, weighted routing or
 fill-first) and native per-auth/model cooldown. There is **no Scheduler** and no
@@ -388,7 +389,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.3_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.1.4_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.
