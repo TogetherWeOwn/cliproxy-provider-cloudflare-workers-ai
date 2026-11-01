@@ -122,8 +122,16 @@ func tallyLimitError(retry time.Duration) *pluginabi.Error {
 func requestTooLargeError() *pluginabi.Error {
 	return &pluginabi.Error{Code: "request_too_large", Message: "request estimate exceeds the Workers AI daily free neuron allocation; lower max_tokens or the prompt", HTTPStatus: http.StatusBadRequest}
 }
+
+// The message carries the code token because the host renders pre-dispatch
+// refusals to HTTP clients as {"error": message}: the Code field never
+// reaches them, so a connector classifying on status plus body needs the
+// label in the body to tell this guard refusal apart from a downstream 429
+// or 5xx. Keep the token as a prefix; log lines are often truncated on the
+// right, and "refused to avoid paid usage" alone is shared with
+// quota_exhausted.
 func usageUnverifiedError() *pluginabi.Error {
-	return &pluginabi.Error{Code: "quota_unverified", Message: "today's Workers AI neuron usage cannot be verified; refused to avoid paid usage", HTTPStatus: http.StatusServiceUnavailable, Retryable: true, RetryAfterSeconds: 60}
+	return &pluginabi.Error{Code: "quota_unverified", Message: "quota_unverified: today's Workers AI neuron usage cannot be verified; refused to avoid paid usage", HTTPStatus: http.StatusServiceUnavailable, Retryable: true, RetryAfterSeconds: 60}
 }
 
 // admit charges estimate to the credential's account or refuses. It never
