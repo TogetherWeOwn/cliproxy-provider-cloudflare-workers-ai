@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -84,15 +85,14 @@ func TestDailyQuotaUsesAccountWideUTCNeuronsAndSeparateAnalyticsToken(t *testing
 			t.Fatalf("quota %v %v", out, err)
 		}
 		b := out.Groups[0].Buckets[0]
-		if b.Window != "daily" || b.RemainingFraction != 0 || b.ResetTime != "2030-01-02T00:00:00Z" {
+		if b.Window != "Daily free neurons" || b.Description != "" || b.RemainingFraction != 0 || b.ResetTime != "2030-01-02T00:00:00Z" {
 			t.Fatalf("bad bucket %+v", b)
 		}
-		metrics := map[string]float64{}
-		for _, m := range out.Summary {
-			metrics[m.Key] = m.Value
+		if len(out.Summary) != 1 || out.Summary[0].Key != "neurons_above_free" || out.Summary[0].Value != 2500 {
+			t.Fatalf("bad summary %+v, want only the 2500-neuron overage chip", out.Summary)
 		}
-		if metrics["daily_free_neurons"] != 10000 || metrics["neurons_used_today"] != 12500 || metrics["neurons_above_free"] != 2500 {
-			t.Fatalf("bad summary %v", metrics)
+		if violations := kit.CheckCard(out); len(violations) != 0 {
+			t.Fatalf("CheckCard violations: %v", violations)
 		}
 	}
 	if polls.Load() != 1 {
@@ -102,6 +102,13 @@ func TestDailyQuotaUsesAccountWideUTCNeuronsAndSeparateAnalyticsToken(t *testing
 	out, err := q.FetchQuota(context.Background(), req)
 	if err != nil || out.Groups[0].Buckets[0].RemainingFraction != .5 || polls.Load() != 2 {
 		t.Fatal("capacity change cached incorrectly", err)
+	}
+	// Usage inside the free allocation emits no chips: the counters repeat the bar.
+	if len(out.Summary) != 0 {
+		t.Fatalf("summary = %+v, want no chips under the free allocation", out.Summary)
+	}
+	if violations := kit.CheckCard(out); len(violations) != 0 {
+		t.Fatalf("CheckCard violations: %v", violations)
 	}
 	desc, err := q.DescribeQuota(context.Background(), pluginapi.QuotaDescribeRequest{})
 	if err != nil || desc.SupportsReset || len(desc.SupportedProviders) != 1 || desc.SupportedProviders[0] != "cloudflare-workers-ai" {
