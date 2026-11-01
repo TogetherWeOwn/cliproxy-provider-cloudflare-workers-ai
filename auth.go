@@ -134,8 +134,8 @@ type authProvider struct {
 }
 
 // guard learns the host's global proxy-url from each parse/refresh request.
-func newAuthProvider(guard *freeGuard) *authProvider {
-	return &authProvider{guard: guard, APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
+func newAuthProvider(guard *freeGuard) (*authProvider, error) {
+	p := &authProvider{guard: guard, APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
 		if _, ok := fields["id"]; ok {
 			return invalidAuth()
 		}
@@ -146,6 +146,19 @@ func newAuthProvider(guard *freeGuard) *authProvider {
 		}
 		return err
 	}}, files: make(map[string][32]byte), owners: make(map[[32]byte]string)}
+	// Only the two string fields are login fields: the login page submits every
+	// answer as a JSON string, while credentialsFields (numberField, the
+	// stay_within_free bool) requires numbers/booleans for the tunables, so
+	// those stay file-managed. Parse is the full ParseAuth pipeline.
+	login, err := kit.NewAPIKeyLogin(kit.APIKeyLoginConfig{Provider: provider, Parse: p.ParseAuth, Fields: []kit.APIKeyLoginField{
+		{Name: "account_id", Label: "Account ID", Description: "Cloudflare account ID: 32 lowercase hex characters.", Required: true},
+		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	p.APIKeyAuth.Login = login
+	return p, nil
 }
 func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 	p.guard.observeHost(req.Host)

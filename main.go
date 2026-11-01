@@ -24,12 +24,16 @@ func makePlugin(host kit.Caller) (*kit.Runtime, error) {
 	guard := newFreeGuard(client)
 	guard.started = time.Now()
 	models := newCatalog(guard)
+	auth, err := newAuthProvider(guard)
+	if err != nil {
+		return nil, err
+	}
 	return kit.New(kit.Definition{
 		Metadata:       pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai"},
 		ModelNamespace: "cloudflare",
 		Configure:      configureBase,
 		Capabilities: pluginapi.Capabilities{
-			AuthProvider: newAuthProvider(guard), ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(guard),
+			AuthProvider: auth, ManagementAPI: auth.Login, ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(guard),
 			ExecutorModelScope:   pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,
 		},
