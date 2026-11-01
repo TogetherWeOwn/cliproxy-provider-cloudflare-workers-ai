@@ -112,7 +112,8 @@ authorization and are performed by an operator, not by this repository:
 
 1. Auth parse and persistence; duplicate-file rejection; stable auth ID across
    a reload of the same file.
-2. Quota card: one `daily` bucket, reset at the next `00:00:00Z`, usage matching
+2. Quota card: one `Daily free neurons` bucket with no description and an empty
+   summary, reset at the next `00:00:00Z`, remaining fraction matching
    the dashboard's Workers AI usage within analytics delay. If the GraphQL query
    is rejected, inspect the live schema by introspection before changing code.
 3. Model list contains only `cloudflare/@cf/...` IDs; the executor sends the

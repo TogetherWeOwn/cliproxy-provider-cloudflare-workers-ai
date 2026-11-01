@@ -202,17 +202,18 @@ field/filter combination in a static Workers AI example. **Do not mistake mock/s
 successful live GraphQL canary.** See the explicit evidence boundary in
 [Sources](docs/SOURCES.md).
 
-One group contains one `window: daily` bucket:
+One group contains one `window: Daily free neurons` bucket with no description:
 
-- capacity: configured daily free neurons;
-- used: today's analytics `sum.totalNeurons`;
-- remaining fraction: `max(0, 1 - used/capacity)`;
+- remaining fraction: `max(0, 1 - used/capacity)` from today's analytics
+  `sum.totalNeurons` against the configured daily free neurons;
 - reset time: next `00:00:00Z`.
 
-The summary reports capacity, consumed neurons and `neurons_above_free`.
-The last value is measured total minus the configured free capacity, floored at
+The summary is empty unless usage exceeds the free allocation, in which case
+a single `Above free allocation` chip reports the overage in neurons. The
+overage is measured total minus the configured free capacity, floored at
 zero; it is **not an invoice, proof of paid-plan status, or confirmed billed
-usage**. No dollar charge or plan entitlement is fabricated.
+usage**. Capacity and consumed counters stay off the card because they repeat
+the bar. No dollar charge or plan entitlement is fabricated.
 
 Successful readings have the kit's 60-second per-auth/credential cache, discarded
 at UTC midnight. A read crossing midnight is rejected and retried, not cached
