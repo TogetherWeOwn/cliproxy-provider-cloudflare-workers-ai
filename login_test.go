@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"html"
 	"strings"
@@ -66,8 +64,8 @@ func startTestLoginTTL(t *testing.T, ttl time.Duration) (*authProvider, pluginap
 func TestAPIKeyLoginWired(t *testing.T) {
 	ctx := context.Background()
 	p, start := startTestLogin(t)
-	// Kit v0.4.1 returns a root-relative login page URL so the panel can open
-	// it against its own origin instead of the host's loopback callback base.
+	// The kit returns a root-relative login URL so the panel resolves it
+	// against its own origin instead of the host's loopback callback base.
 	if !strings.HasPrefix(start.URL, testResourceBase+"/login?state=") {
 		t.Fatalf("unexpected login URL %q", start.URL)
 	}
@@ -108,12 +106,6 @@ func TestAPIKeyLoginWired(t *testing.T) {
 	if done.Auth.Provider != provider || store["account_id"] != testAccount || store["api_key"] != "example-key" {
 		t.Fatalf("credentials lost through login: %+v", done.Auth)
 	}
-	// FilenameFields puts account_id into the deterministic login file name, so
-	// it must differ from the historical key-only derivation.
-	keyDigest := sha256.Sum256([]byte("example-key"))
-	if keyOnly := provider + "-" + hex.EncodeToString(keyDigest[:6]) + ".json"; done.Auth.FileName == keyOnly {
-		t.Fatalf("login file name %q ignores account_id", done.Auth.FileName)
-	}
 	other, err := newAuthProvider(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -125,6 +117,74 @@ func TestAPIKeyLoginWired(t *testing.T) {
 	again, err := p.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: start.State})
 	if err != nil || again.Status != pluginapi.AuthLoginStatusPending {
 		t.Fatalf("consumed login redelivered: %+v %v", again, err)
+	}
+}
+
+// loginOnce runs one full login (start, submit, poll) against an already
+// registered provider and returns the delivered auth.
+func loginOnce(t *testing.T, p *authProvider, account string) pluginapi.AuthData {
+	t.Helper()
+	ctx := context.Background()
+	start, err := p.StartLogin(ctx, pluginapi.AuthLoginStartRequest{Provider: provider,
+		BaseURL: testBaseURL, Host: pluginapi.HostConfigSummary{AuthDir: "/tmp/cloudflare-auth"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submit, err := p.Login.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "POST",
+		Path: testSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"` + account + `"}`)})
+	if err != nil || submit.StatusCode != 200 {
+		t.Fatalf("submit for %s: %+v %v", account, submit, err)
+	}
+	done, err := p.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: start.State})
+	if err != nil || done.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("poll for %s: %+v %v", account, done, err)
+	}
+	return done.Auth
+}
+
+// TestAPIKeyLoginSameTokenTwoAccounts is the regression test for the kit
+// filename collision: identity is account+token, so the same token under
+// two accounts must mint two file names and keep both ownership entries,
+// instead of the second login overwriting the first account's entry.
+func TestAPIKeyLoginSameTokenTwoAccounts(t *testing.T) {
+	ctx := context.Background()
+	p, _ := startTestLogin(t)
+	first := loginOnce(t, p, testAccount)
+	second := loginOnce(t, p, otherAccount)
+	if first.FileName == "" || first.FileName == second.FileName {
+		t.Fatalf("accounts share a login filename: %q vs %q", first.FileName, second.FileName)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("accounts share an auth ID: %q", first.ID)
+	}
+	// Both ownership entries survive: a host parse of each saved login file
+	// commits under its own file name, and either identity under a third
+	// filename is a duplicate. (The kit guard's maps are its own, and login
+	// parses only reserve ownership, so this is asserted behaviorally.)
+	for _, tc := range []struct {
+		auth    pluginapi.AuthData
+		account string
+	}{{first, testAccount}, {second, otherAccount}} {
+		if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: tc.auth.FileName, RawJSON: authJSON(tc.account, "example-key")}); err != nil {
+			t.Fatalf("host parse of %s: %v", tc.auth.FileName, err)
+		}
+		if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: "third.json", RawJSON: authJSON(tc.account, "example-key")}); err == nil || kit.MapError(err).Code != "duplicate_auth" {
+			t.Fatalf("third filename for %s = %v, want duplicate_auth", tc.account, err)
+		}
+	}
+	// Re-login of the first identity stays idempotent, including under a
+	// mixed-case spelling of the account (credentialsFields canonicalizes
+	// to lowercase): same filename, no duplicate_auth, ownership unchanged.
+	again := loginOnce(t, p, strings.ToUpper(testAccount))
+	if again.FileName != first.FileName || again.ID != first.ID {
+		t.Fatalf("re-login not idempotent: %+v vs %+v", again, first)
+	}
+	if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: first.FileName, RawJSON: authJSON(testAccount, "example-key")}); err != nil {
+		t.Fatalf("host reparse after re-login: %v", err)
+	}
+	if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: "third.json", RawJSON: authJSON(testAccount, "example-key")}); err == nil || kit.MapError(err).Code != "duplicate_auth" {
+		t.Fatalf("re-login churned ownership: %v", err)
 	}
 }
 
