@@ -617,3 +617,20 @@ func TestColdStartHoldIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// api.cloudflare.com offers HTTP/2 over TLS; the analytics client must still
+// read it (kit quota transport, HTTP/1.1 only) instead of failing every read.
+func TestAnalyticsClientReadsHTTP2TLSServer(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"accounts":[{"accountTag":"` + testAccount + `","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":12.5}}]}]}}}`))
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	client := newAnalyticsClient()
+	client.Transport.(*http.Transport).TLSClientConfig.RootCAs = server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	used, err := fetchAnalytics(context.Background(), client, server.URL, testCredentials(t), time.Now())
+	if err != nil || used != 12.5 {
+		t.Fatalf("used %v err %v", used, err)
+	}
+}
