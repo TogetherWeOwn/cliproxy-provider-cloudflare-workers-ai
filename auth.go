@@ -8,7 +8,6 @@ import (
 	"math"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
@@ -123,18 +122,25 @@ func numberField(fields map[string]any, name string, fallback float64) (float64,
 }
 func validToken(token string) bool { return token != "" && !strings.ContainsAny(token, "\r\n\x00") }
 
-// A watcher can reparse one filename. Retain only identity digests for duplicate
-// checks; deleting/renaming an auth file requires a plugin lifecycle reset.
+// ownership is the kit filename-ownership duplicate guard: it retains only
+// identity digests, so a watcher can reparse one filename. Host parses commit
+// ownership (deleting/renaming an auth file still requires a plugin lifecycle
+// reset), while login-validation parses are provisional and only reserve the
+// digest until the login session expires, so an abandoned login releases it.
 type authProvider struct {
 	kit.APIKeyAuth
-	guard  *freeGuard
-	mu     sync.Mutex
-	files  map[string][32]byte
-	owners map[[32]byte]string
+	guard     *freeGuard
+	ownership kit.KeyOwnership
 }
 
 // guard learns the host's global proxy-url from each parse/refresh request.
 func newAuthProvider(guard *freeGuard) (*authProvider, error) {
+	return newAuthProviderWithLoginTTL(guard, 0)
+}
+
+// loginTTL zero keeps the kit's default login session TTL; tests pass a short
+// TTL so an abandoned login's ownership reservation lapses quickly.
+func newAuthProviderWithLoginTTL(guard *freeGuard, loginTTL time.Duration) (*authProvider, error) {
 	p := &authProvider{guard: guard, APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
 		if _, ok := fields["id"]; ok {
 			return invalidAuth()
@@ -145,14 +151,17 @@ func newAuthProvider(guard *freeGuard) (*authProvider, error) {
 			fields["api_key"] = c.token
 		}
 		return err
-	}}, files: make(map[string][32]byte), owners: make(map[[32]byte]string)}
+	}}}
 	// Only the two string fields are login fields: the login page submits every
 	// answer as a JSON string, while credentialsFields (numberField, the
 	// stay_within_free bool) requires numbers/booleans for the tunables, so
 	// those stay file-managed. Parse is the full ParseAuth pipeline.
-	login, err := kit.NewAPIKeyLogin(kit.APIKeyLoginConfig{Provider: provider, Parse: p.ParseAuth, Fields: []kit.APIKeyLoginField{
+	// FilenameFields carries account_id because the credential identity (and
+	// the ownership digest below) is account plus token, not the token alone:
+	// two accounts sharing a token must mint distinct login file names.
+	login, err := kit.NewAPIKeyLogin(kit.APIKeyLoginConfig{Provider: provider, Parse: p.ParseAuth, SessionTTL: loginTTL, FilenameFields: []string{"account_id"}, Fields: []kit.APIKeyLoginField{
 		{Name: "account_id", Label: "Account ID", Description: "Cloudflare account ID: 32 lowercase hex characters.", Required: true},
-		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false},
+		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false, Secret: true},
 	}})
 	if err != nil {
 		return nil, err
@@ -173,15 +182,9 @@ func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseReq
 	p.guard.observeAuth(c)
 	digest := sha256.Sum256([]byte(c.account + "\x00" + c.token))
 	out.Auth.ID = provider + ":" + hex.EncodeToString(digest[:6])
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if file, ok := p.owners[digest]; ok && file != req.FileName {
-		return pluginapi.AuthParseResponse{}, &pluginabi.Error{Code: "duplicate_auth", Message: "account and token already configured in another auth file", HTTPStatus: 400}
+	if err := p.ownership.Claim(ctx, req.FileName, digest); err != nil {
+		return pluginapi.AuthParseResponse{}, err
 	}
-	if old, ok := p.files[req.FileName]; ok && old != digest {
-		delete(p.owners, old)
-	}
-	p.files[req.FileName], p.owners[digest] = digest, req.FileName
 	return out, nil
 }
 func (p *authProvider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
