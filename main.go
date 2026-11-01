@@ -17,12 +17,15 @@ func init() {
 func makePlugin(host kit.Caller) (*kit.Runtime, error) {
 	client := newAnalyticsClient()
 	quota := newQuotaProvider("", client)
-	models := newCatalog()
+	// One guard per plugin instance: inference and catalog probes share the
+	// per-account readings and admission tally.
+	guard := newFreeGuard()
+	models := newCatalog(guard)
 	return kit.New(kit.Definition{
 		Metadata:  pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai"},
 		Configure: configureBase,
 		Capabilities: pluginapi.Capabilities{
-			AuthProvider: newAuthProvider(), ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(),
+			AuthProvider: newAuthProvider(), ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(guard),
 			ExecutorModelScope:   pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,
 		},

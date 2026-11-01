@@ -35,6 +35,10 @@ const model = "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"
 
 var account = strings.Repeat("a", 32)
 
+// exhausted is a second mock account whose analytics already show 9,900 of
+// 10,000 free neurons, so the free-only guard must refuse before dispatch.
+var exhausted = strings.Repeat("c", 32)
+
 type executors map[string]coreauth.ProviderExecutor
 
 func (m executors) Executor(p string) (coreauth.ProviderExecutor, bool) { e, ok := m[p]; return e, ok }
@@ -67,10 +71,14 @@ func TestRealHostLoader(t *testing.T) {
 				Query     string
 				Variables map[string]string
 			}
-			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account || !strings.Contains(wire.Query, "totalNeurons") {
+			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account && wire.Variables["account"] != exhausted || !strings.Contains(wire.Query, "totalNeurons") {
 				t.Error("bad GraphQL query")
 			}
-			io.WriteString(w, `{"data":{"viewer":{"accounts":[{"accountTag":"`+account+`","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":7500}}]}]}}}`)
+			used := "7500"
+			if wire.Variables["account"] == exhausted {
+				used = "9900"
+			}
+			io.WriteString(w, `{"data":{"viewer":{"accounts":[{"accountTag":"`+wire.Variables["account"]+`","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":`+used+`}}]}]}}}`)
 		case "/client/v4/accounts/" + account + "/ai/models/search":
 			if r.Header.Get("Authorization") != "Bearer example-key" || r.URL.Query().Get("task") != "Text Generation" {
 				t.Error("bad discovery request")
@@ -118,6 +126,9 @@ func TestRealHostLoader(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, `{"id":"chat-example","object":"chat.completion","model":"@cf/meta/llama-3.1-8b-instruct-fp8","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+		case "/client/v4/accounts/" + exhausted + "/ai/v1/chat/completions":
+			t.Error("request dispatched past the free-only guard")
+			w.WriteHeader(500)
 		default:
 			t.Errorf("unexpected provider path %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -163,7 +174,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.1" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.2" {
 		t.Fatalf("metadata %+v", info)
 	}
 	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
@@ -303,6 +314,35 @@ func TestRealHostLoader(t *testing.T) {
 			t.Fatal("healthy sibling impaired")
 		}
 	})
+	t.Run("free-only guard refuses before dispatch until UTC reset", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": exhausted, "api_key": "example-key", "analytics_api_key": "analytics-key"})
+		spent, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "exhausted.json", RawJSON: raw})
+		if err != nil || !handled || spent == nil {
+			t.Fatal(err)
+		}
+		mgr := coreauth.NewManager(nil, nil, nil)
+		mgr.SetRetryConfig(0, 0, 1)
+		mgr.RegisterExecutor(ex)
+		spent = spent.Clone()
+		spent.ID = "exhausted-auth"
+		spent.Status = coreauth.StatusActive
+		if _, err = mgr.Register(ctx, spent); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(spent.ID, spent.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(spent.ID) })
+		before := time.Now().UTC()
+		reset := time.Date(before.Year(), before.Month(), before.Day()+1, 0, 0, 0, 0, time.UTC)
+		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hello"}]}`)}, opts)
+		if e, ok := err.(interface{ StatusCode() int }); !ok || e.StatusCode() != 429 {
+			t.Fatalf("guard refusal %T %v", err, err)
+		}
+		got, _ := mgr.GetByID(spent.ID)
+		state := got.ModelStates[model]
+		if state == nil || !state.Quota.Exceeded || state.NextRetryAfter.Before(reset) || state.NextRetryAfter.After(reset.Add(3*time.Second)) {
+			t.Fatalf("guard refusal lost the UTC reset hint %+v", state)
+		}
+	})
 	t.Run("pinned host transient 429 marker limitation", func(t *testing.T) {
 		mgr := coreauth.NewManager(nil, nil, nil)
 		mgr.SetRetryConfig(0, 0, 1)
@@ -333,7 +373,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.1" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.2" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }

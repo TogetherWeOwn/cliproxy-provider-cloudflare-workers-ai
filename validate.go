@@ -53,6 +53,11 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 				return
 			}
 			defer func() { <-sem }()
+			// A probe the free-only guard refuses is inconclusive: no request
+			// is sent and the model stays advertised.
+			if c.guard.admit(budget, client, cred, estimateNeurons(probeBody(id))) != nil {
+				return
+			}
 			if usable, definitive := probeModel(budget, client, cred, id); definitive {
 				alive[i] = usable
 				c.cache.put(digest, id, usable)
@@ -82,8 +87,7 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 func probeModel(ctx context.Context, client pluginapi.HostHTTPClient, cred credentials, id string) (usable, definitive bool) {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}}, "max_tokens": 1, "stream": false})
-	resp, err := client.Do(pctx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: accountBase(cred) + "/v1/chat/completions", Headers: http.Header{"Authorization": {"Bearer " + cred.token}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}, Body: body})
+	resp, err := client.Do(pctx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: accountBase(cred) + "/v1/chat/completions", Headers: http.Header{"Authorization": {"Bearer " + cred.token}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}, Body: probeBody(id)})
 	if err != nil {
 		return true, false
 	}
@@ -95,6 +99,11 @@ func probeModel(ctx context.Context, client pluginapi.HostHTTPClient, cred crede
 		return true, true
 	}
 	return true, false
+}
+
+func probeBody(id string) []byte {
+	body, _ := json.Marshal(map[string]any{"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}}, "max_tokens": 1, "stream": false})
+	return body
 }
 
 // verdictCache remembers definitive per-account model verdicts so hot reloads

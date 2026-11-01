@@ -17,10 +17,11 @@ import (
 
 const (
 	provider            = "cloudflare-workers-ai"
-	version             = "0.1.1"
+	version             = "0.1.2"
 	modelPrefix         = "cloudflare/"
 	upstreamBase        = "https://api.cloudflare.com"
 	defaultDailyNeurons = 10000.0
+	defaultSafetyMargin = 500.0
 )
 
 var accountPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -28,10 +29,13 @@ var accountPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 type credentials struct {
 	account, token, analyticsToken string
 	capacity                       float64
+	// The free-only hard stop is on unless an auth explicitly opts out.
+	stayWithinFree bool
+	safetyMargin   float64
 }
 
 func invalidAuth() *pluginabi.Error {
-	return &pluginabi.Error{Code: "invalid_auth", Message: "expected an account_id, API token and optional positive daily_free_neurons", HTTPStatus: 400}
+	return &pluginabi.Error{Code: "invalid_auth", Message: "expected an account_id, API token, optional positive daily_free_neurons and safety_margin_neurons, and optional boolean stay_within_free", HTTPStatus: 400}
 }
 
 // Validate at every boundary, including host-metadata overlays after persistence.
@@ -59,21 +63,39 @@ func credentialsFields(fields map[string]any) (credentials, error) {
 		}
 		c.analyticsToken = strings.TrimSpace(token)
 	}
-	c.capacity = defaultDailyNeurons
-	if value, exists := fields["daily_free_neurons"]; exists {
-		switch n := value.(type) {
-		case json.Number:
-			c.capacity, _ = n.Float64()
-		case float64:
-			c.capacity = n
-		default:
-			return c, invalidAuth()
-		}
-		if c.capacity <= 0 || math.IsNaN(c.capacity) || math.IsInf(c.capacity, 0) {
+	var ok bool
+	if c.capacity, ok = positiveField(fields, "daily_free_neurons", defaultDailyNeurons); !ok {
+		return c, invalidAuth()
+	}
+	if c.safetyMargin, ok = positiveField(fields, "safety_margin_neurons", defaultSafetyMargin); !ok {
+		return c, invalidAuth()
+	}
+	c.stayWithinFree = true
+	if value, exists := fields["stay_within_free"]; exists {
+		if c.stayWithinFree, ok = value.(bool); !ok {
 			return c, invalidAuth()
 		}
 	}
 	return c, nil
+}
+func positiveField(fields map[string]any, name string, fallback float64) (float64, bool) {
+	value, exists := fields[name]
+	if !exists {
+		return fallback, true
+	}
+	var n float64
+	switch v := value.(type) {
+	case json.Number:
+		var err error
+		if n, err = v.Float64(); err != nil {
+			return 0, false
+		}
+	case float64:
+		n = v
+	default:
+		return 0, false
+	}
+	return n, n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0)
 }
 func validToken(token string) bool { return token != "" && !strings.ContainsAny(token, "\r\n\x00") }
 

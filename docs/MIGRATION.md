@@ -24,7 +24,10 @@ auth-directory watcher.
 3. Record today's callers and model IDs routed to Cloudflare, and how quota is
    displayed today, so the cutover can be compared.
 4. Confirm the account plan. On Workers Paid, usage above 10,000 neurons/day is
-   billed; this plugin's card is display-only and cannot cap spend.
+   billed. The plugin's free-only hard stop (`stay_within_free`, default on)
+   refuses requests that could exceed the free allocation, and refuses when
+   usage cannot be verified. Read its overshoot bound in the README. Keep it on
+   unless paid usage is approved.
 
 ## 2. Create an isolated staging instance
 
@@ -70,9 +73,11 @@ For each distinct account/token pair, write **one** private auth file (mode
 - `account_id`: the 32-hex ID taken from the old `base-url`.
 - `api_key`: the old `api-key` value (a Workers AI Read/Write API token).
 - `analytics_api_key`: optional separate token with Account Analytics Read;
-  add one if the inference token lacks that permission, otherwise the quota
-  card shows an analytics error (inference keeps working).
+  add one if the inference token lacks that permission. Without it, the quota
+  card shows an analytics error and, with `stay_within_free` on, inference is
+  refused (`quota_unverified`) because usage cannot be checked.
 - `daily_free_neurons`: omit to use 10,000.
+- `stay_within_free` / `safety_margin_neurons`: omit to use `true` / 500.
 
 Do not set `id`; identity is derived from account ID + token. Several tokens
 on one account share **one** daily allocation; each card will show the same

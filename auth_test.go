@@ -67,6 +67,14 @@ func TestAuthValidationAndMetadataPrecedence(t *testing.T) {
 		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"daily_free_neurons":0}`,
 		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"daily_free_neurons":"10000"}`,
 		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"disabled":"false"}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"stay_within_free":"false"}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"stay_within_free":0}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"stay_within_free":null}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"safety_margin_neurons":0}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"safety_margin_neurons":-500}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"safety_margin_neurons":"500"}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"safety_margin_neurons":null}`,
+		strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"safety_margin_neurons":1e999}`,
 	} {
 		out, err := p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{FileName: "invalid.json", RawJSON: []byte(raw)})
 		if raw == `{}` {
@@ -87,7 +95,23 @@ func TestAuthValidationAndMetadataPrecedence(t *testing.T) {
 		t.Fatalf("metadata precedence failed %v", err)
 	}
 	cred, err = credentialsFrom(authJSON(testAccount, "example-key"), nil)
-	if err != nil || cred.capacity != 10000 || cred.analyticsToken != "example-key" {
+	if err != nil || cred.capacity != 10000 || cred.analyticsToken != "example-key" || !cred.stayWithinFree || cred.safetyMargin != 500 {
 		t.Fatal("wrong defaults", err)
+	}
+	valid := strings.TrimSuffix(string(authJSON(testAccount, "example-key")), "}") + `,"stay_within_free":false,"safety_margin_neurons":250.5}`
+	out, err := p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{FileName: "opt-out.json", RawJSON: []byte(valid)})
+	if err != nil || !out.Handled {
+		t.Fatal("rejected valid guard fields", err)
+	}
+	cred, err = credentialsFrom(out.Auth.StorageJSON, out.Auth.Metadata)
+	if err != nil || cred.stayWithinFree || cred.safetyMargin != 250.5 {
+		t.Fatalf("guard fields not persisted %+v %v", cred.stayWithinFree, err)
+	}
+	cred, err = credentialsFrom(out.Auth.StorageJSON, map[string]any{"stay_within_free": true, "safety_margin_neurons": float64(900)})
+	if err != nil || !cred.stayWithinFree || cred.safetyMargin != 900 {
+		t.Fatal("metadata overlay ignored for guard fields", err)
+	}
+	if _, err = credentialsFrom(out.Auth.StorageJSON, map[string]any{"stay_within_free": "no"}); err == nil {
+		t.Fatal("invalid metadata overlay accepted")
 	}
 }

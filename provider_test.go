@@ -77,7 +77,7 @@ func (c mockHostClient) DoStream(ctx context.Context, r pluginapi.HTTPRequest) (
 func TestChatExecutionStripsPrefixAndStreamsIncrementally(t *testing.T) {
 	gate := make(chan struct{})
 	defer close(gate)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" || r.Method != "POST" || r.Header.Get("Authorization") != "Bearer example-key" {
 			t.Error("incorrect chat request")
 		}
@@ -97,9 +97,9 @@ func TestChatExecutionStripsPrefixAndStreamsIncrementally(t *testing.T) {
 			return
 		}
 		io.WriteString(w, `{"id":"example","choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":5}}`)
-	}))
+	})))
 	defer server.Close()
-	ex := newExecutor()
+	ex := newExecutor(newFreeGuard())
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	req := pluginapi.ExecutorRequest{Payload: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8","stream":true,"temperature":0.25}`), StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
@@ -123,23 +123,23 @@ func TestChatExecutionStripsPrefixAndStreamsIncrementally(t *testing.T) {
 	cancel()
 }
 func TestRawHTTPIsPinnedAndInvalidModelsRejected(t *testing.T) {
-	out, err := prepareHTTP(context.Background(), pluginapi.ExecutorHTTPRequest{URL: "https://example.invalid/escape", Method: "DELETE", Headers: http.Header{"Authorization": {"Bearer attacker"}}, Body: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"}`), StorageJSON: authJSON(testAccount, "example-key")})
+	out, _, err := upstreamRequest(httpExecutorRequest(pluginapi.ExecutorHTTPRequest{URL: "https://example.invalid/escape", Method: "DELETE", Headers: http.Header{"Authorization": {"Bearer attacker"}}, Body: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"}`), StorageJSON: authJSON(testAccount, "example-key")}))
 	if err != nil || out.URL != "https://api.cloudflare.com/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" || out.Method != "POST" || out.Headers.Get("Authorization") != "Bearer example-key" {
 		t.Fatal("untrusted destination/headers forwarded", err)
 	}
 	for _, body := range []string{`null`, `[]`, `{}`, `{"model":"@cf/meta/llama-3.1-8b-instruct-fp8"}`, `{"model":"cloudflare/"}`, `{"model":"cloudflare/cloudflare/@cf/model"}`} {
-		if _, err := buildRequest(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(body), StorageJSON: authJSON(testAccount, "example-key")}); err == nil {
+		if _, _, err := upstreamRequest(pluginapi.ExecutorRequest{Payload: []byte(body), StorageJSON: authJSON(testAccount, "example-key")}); err == nil {
 			t.Fatalf("accepted %s", body)
 		}
 	}
-	count, err := newExecutor().CountTokens(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(`{"model":"example"}`)})
+	count, err := newExecutor(newFreeGuard()).CountTokens(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(`{"model":"example"}`)})
 	if err != nil || count.Metadata["estimated"] != true {
 		t.Fatal("count must be local estimate", err)
 	}
 }
 func TestDiscoveryUsesSearchPaginationAndNamespacesChatOnly(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" { // validation probe
 			w.Header().Set("Content-Type", "text/event-stream")
 			io.WriteString(w, "data: [DONE]\n\n")
@@ -154,17 +154,17 @@ func TestDiscoveryUsesSearchPaginationAndNamespacesChatOnly(t *testing.T) {
 		} else {
 			io.WriteString(w, `{"success":true,"errors":[],"result":[{"name":"@cf/meta/llama-3.1-8b-instruct-fp8","task":{"name":"Text Generation"}},{"name":"@cf/qwen/qwen3-30b-a3b-fp8","task":{"name":"Text Generation"}}],"result_info":{"page":2,"total_pages":2}}`)
 		}
-	}))
+	})))
 	defer server.Close()
-	out, err := newCatalog().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
+	out, err := newCatalog(newFreeGuard()).ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
 	if err != nil || len(out.Models) != 2 || calls.Load() != 2 {
 		t.Fatalf("discovery models=%d calls=%d err=%v", len(out.Models), calls.Load(), err)
 	}
 	if out.Models[0].ID != "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8" || out.Models[1].ID != "cloudflare/@cf/qwen/qwen3-30b-a3b-fp8" {
 		t.Fatal("incorrect model IDs")
 	}
-	static, _ := newCatalog().StaticModels(context.Background(), pluginapi.StaticModelRequest{})
-	reg, _ := newCatalog().RegisterModels(context.Background(), pluginapi.ModelRegistrationRequest{})
+	static, _ := newCatalog(newFreeGuard()).StaticModels(context.Background(), pluginapi.StaticModelRequest{})
+	reg, _ := newCatalog(newFreeGuard()).RegisterModels(context.Background(), pluginapi.ModelRegistrationRequest{})
 	if len(static.Models) < 2 || len(reg.Models) != len(static.Models) {
 		t.Fatal("no static fallback")
 	}
@@ -176,8 +176,8 @@ func TestDiscoveryUsesSearchPaginationAndNamespacesChatOnly(t *testing.T) {
 }
 func TestDiscoveryFailureFallsBackWithoutFabricatingEntitlements(t *testing.T) {
 	for _, raw := range []string{`{"success":false,"errors":[{"message":"example-secret"}]}`, `{}`, `{"success":true,"result":null}`, strings.Repeat("x", (1<<20)+1)} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, raw) }))
-		out, err := newCatalog().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
+		server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, raw) })))
+		out, err := newCatalog(newFreeGuard()).ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
 		server.Close()
 		if err != nil || len(out.Models) < 2 {
 			t.Fatalf("static fallback failed %v", err)
@@ -210,10 +210,10 @@ func TestErrorClassificationForStreamAndNonstream(t *testing.T) {
 		if strings.Contains(e.Message, "secret") {
 			t.Fatal("body leaked")
 		}
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); io.WriteString(w, tc.body) }))
+		server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); io.WriteString(w, tc.body) })))
 		req := pluginapi.ExecutorRequest{Payload: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"}`), StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
-		_, a := newExecutor().Execute(context.Background(), req)
-		_, b := newExecutor().ExecuteStream(context.Background(), req)
+		_, a := newExecutor(newFreeGuard()).Execute(context.Background(), req)
+		_, b := newExecutor(newFreeGuard()).ExecuteStream(context.Background(), req)
 		server.Close()
 		var ae, be *pluginabi.Error
 		if !errors.As(a, &ae) || !errors.As(b, &be) || ae.Code != tc.code || be.Code != tc.code || ae.HTTPStatus != be.HTTPStatus {

@@ -7,7 +7,7 @@
       "description": "Account auth, namespaced OpenAI chat models and daily neuron quota cards",
       "author": "TogetherWeOwn",
       "repository": "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "license": "MIT",
       "tags": ["provider", "cloudflare", "quota"],
       "install": {"type": "github-release"}

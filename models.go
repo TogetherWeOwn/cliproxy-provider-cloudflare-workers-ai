@@ -18,10 +18,12 @@ type catalog struct {
 	// probes is shared by every discovery so overlapping ModelsForAuth calls
 	// stay within probeConcurrency in total.
 	probes chan struct{}
+	// guard admits each validation probe like inference.
+	guard *freeGuard
 }
 
-func newCatalog() catalog {
-	return catalog{cache: newVerdictCache(), probes: make(chan struct{}, probeConcurrency)}
+func newCatalog(guard *freeGuard) catalog {
+	return catalog{cache: newVerdictCache(), probes: make(chan struct{}, probeConcurrency), guard: guard}
 }
 
 func modelInfo(id string) pluginapi.ModelInfo {

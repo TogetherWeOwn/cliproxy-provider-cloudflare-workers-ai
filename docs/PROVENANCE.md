@@ -11,12 +11,14 @@ commit `ad3cb9ecd0130b1b7a0ffb122d0d4685bd8e659b`:
 - `internal/providers/cloudflare/module.go` and `config.go`: 3036-versus-3040
   response classification and the 10,000-neuron/00:00 UTC daily window.
 
-Not ported, deliberately: that module's admission/reservation engine, pending
-in-flight neuron ledger, safety margin, pay-as-you-go guard and per-model
-neuron estimates. Those implement a global Scheduler with pre-emptive quota
-avoidance; this plugin follows native CLIProxy provider behavior instead
-(multiple auth records, native routing, reactive cooldown from classified
-errors, display-only quota card).
+Not ported, deliberately: that module's Scheduler, durable reservation engine,
+pending ledger and pay-as-you-go fence. This plugin follows native CLIProxy
+provider behavior instead: multiple auth records, native routing, and reactive
+cooldown from classified errors. The free-only hard stop in `guard.go` is new
+code. It keeps the prior module's intent and its defaults (`stayWithinIncluded`
+on, a 500-neuron safety margin, a 2-minute maximum reading age). It runs as an
+executor admission check, not a scheduler. Its per-model rates are taken
+directly from the official pricing table (see [SOURCES](SOURCES.md)).
 
 The C-ABI wiring, host-compatibility harness layout, release packaging, CI and
 document structure follow the sibling

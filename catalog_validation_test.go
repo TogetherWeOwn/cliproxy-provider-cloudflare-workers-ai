@@ -20,7 +20,7 @@ import (
 func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 	var mu sync.Mutex
 	probes := map[string]int{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
 			io.WriteString(w, `{"success":true,"errors":[],"result":[`+
 				`{"name":"@cf/ok/alive","task":{"name":"Text Generation"}},`+
@@ -66,9 +66,9 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
 		}
-	}))
+	})))
 	defer server.Close()
-	c := newCatalog()
+	c := newCatalog(newFreeGuard())
 	req := pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
 	want := "cloudflare/@cf/ok/alive,cloudflare/@cf/busy/rate-limited,cloudflare/@cf/flaky/server-error,cloudflare/@cf/meta/llama-guard-3-8b"
 	start := time.Now()
@@ -94,18 +94,18 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 }
 
 func TestModelsForAuthHonoursCancellationDuringValidation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
 			io.WriteString(w, `{"success":true,"errors":[],"result":[{"name":"@cf/slow/a","task":{"name":"Text Generation"}}],"result_info":{"page":1,"total_pages":1}}`)
 			return
 		}
 		io.Copy(io.Discard, r.Body)
 		<-r.Context().Done()
-	}))
+	})))
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, err := newCatalog().ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}); err == nil {
+	if _, err := newCatalog(newFreeGuard()).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}); err == nil {
 		t.Fatal("cancelled discovery returned a catalog")
 	}
 }
@@ -145,7 +145,7 @@ func TestConcurrentDiscoveriesShareTheProbeLimit(t *testing.T) {
 	for i := 0; i < 3*probeConcurrency; i++ {
 		names = append(names, `{"name":"@cf/org/m`+string(rune('a'+i))+`","task":{"name":"Text Generation"}}`)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
 			io.WriteString(w, `{"success":true,"errors":[],"result":[`+strings.Join(names, ",")+`],"result_info":{"page":1,"total_pages":1}}`)
 			return
@@ -162,9 +162,9 @@ func TestConcurrentDiscoveriesShareTheProbeLimit(t *testing.T) {
 		inFlight--
 		mu.Unlock()
 		io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
-	}))
+	})))
 	defer server.Close()
-	c := newCatalog()
+	c := newCatalog(newFreeGuard())
 	var wg sync.WaitGroup
 	for _, key := range []string{"key-one", "key-two"} {
 		wg.Add(1)
