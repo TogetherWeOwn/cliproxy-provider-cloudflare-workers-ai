@@ -57,7 +57,9 @@ func startTestLogin(t *testing.T) (*authProvider, pluginapi.AuthLoginStartRespon
 func TestAPIKeyLoginWired(t *testing.T) {
 	ctx := context.Background()
 	p, start := startTestLogin(t)
-	if !strings.HasPrefix(start.URL, "http://127.0.0.1:19000"+testResourceBase+"/login?state=") {
+	// The kit returns a root-relative login URL so the panel resolves it
+	// against its own origin instead of the host's loopback callback base.
+	if !strings.HasPrefix(start.URL, testResourceBase+"/login?state=") {
 		t.Fatalf("unexpected login URL %q", start.URL)
 	}
 	poll, err := p.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: start.State})
@@ -103,6 +105,63 @@ func TestAPIKeyLoginWired(t *testing.T) {
 	again, err := p.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: start.State})
 	if err != nil || again.Status != pluginapi.AuthLoginStatusPending {
 		t.Fatalf("consumed login redelivered: %+v %v", again, err)
+	}
+}
+
+// loginOnce runs one full login (start, submit, poll) against an already
+// registered provider and returns the delivered auth.
+func loginOnce(t *testing.T, p *authProvider, account string) pluginapi.AuthData {
+	t.Helper()
+	ctx := context.Background()
+	start, err := p.StartLogin(ctx, pluginapi.AuthLoginStartRequest{Provider: provider,
+		BaseURL: testBaseURL, Host: pluginapi.HostConfigSummary{AuthDir: "/tmp/cloudflare-auth"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submit, err := p.Login.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "POST",
+		Path: testSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"` + account + `"}`)})
+	if err != nil || submit.StatusCode != 200 {
+		t.Fatalf("submit for %s: %+v %v", account, submit, err)
+	}
+	done, err := p.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: start.State})
+	if err != nil || done.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("poll for %s: %+v %v", account, done, err)
+	}
+	return done.Auth
+}
+
+// TestAPIKeyLoginSameTokenTwoAccounts is the regression test for the kit
+// filename collision: identity is account+token, so the same token under
+// two accounts must mint two file names and keep both ownership entries,
+// instead of the second login overwriting the first account's entry.
+func TestAPIKeyLoginSameTokenTwoAccounts(t *testing.T) {
+	p, _ := startTestLogin(t)
+	first := loginOnce(t, p, testAccount)
+	second := loginOnce(t, p, otherAccount)
+	if first.FileName == "" || first.FileName == second.FileName {
+		t.Fatalf("accounts share a login filename: %q vs %q", first.FileName, second.FileName)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("accounts share an auth ID: %q", first.ID)
+	}
+	p.mu.Lock()
+	files, owners := len(p.files), len(p.owners)
+	p.mu.Unlock()
+	if files != 2 || owners != 2 {
+		t.Fatalf("ownership entries lost: files=%d owners=%d, want 2/2", files, owners)
+	}
+	// Re-login of the first identity stays idempotent: same filename, no
+	// duplicate_auth, no extra ownership entry.
+	again := loginOnce(t, p, testAccount)
+	if again.FileName != first.FileName || again.ID != first.ID {
+		t.Fatalf("re-login not idempotent: %+v vs %+v", again, first)
+	}
+	p.mu.Lock()
+	files, owners = len(p.files), len(p.owners)
+	p.mu.Unlock()
+	if files != 2 || owners != 2 {
+		t.Fatalf("re-login churned ownership: files=%d owners=%d, want 2/2", files, owners)
 	}
 }
 
