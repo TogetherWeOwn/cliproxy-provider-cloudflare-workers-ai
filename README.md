@@ -60,7 +60,7 @@ mode `0600`. Never save actual credentials in this repository.
   hard stop. Set it to `false` only for an account where paid usage is
   approved; the plugin then behaves like v0.1.1 (no usage check before
   dispatch, no output cap).
-- `cold_start_hold_seconds`: optional non-negative number; default **600**
+- `cold_start_hold_seconds`: optional number from 0 to 86,400; default **600**
   (one tally window). After the plugin instance starts (CLIProxy restart or
   plugin reload), the hard stop refuses with a retryable `rate_limit` for this
   long, because a new instance cannot see what an earlier one admitted while

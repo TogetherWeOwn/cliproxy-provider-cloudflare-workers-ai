@@ -608,3 +608,12 @@ func testCredentials(t *testing.T) credentials {
 	}
 	return c
 }
+
+// A hold too large for time.Duration must be refused, not wrap negative.
+func TestColdStartHoldIsBounded(t *testing.T) {
+	for _, v := range []float64{86401, 1e300, -1} {
+		if _, err := credentialsFrom(authJSON(testAccount, "example-key"), map[string]any{"cold_start_hold_seconds": v}); err == nil {
+			t.Fatalf("cold_start_hold_seconds %v accepted", v)
+		}
+	}
+}

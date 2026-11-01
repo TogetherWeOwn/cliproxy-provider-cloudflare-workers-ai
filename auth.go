@@ -80,8 +80,9 @@ func credentialsFields(fields map[string]any) (credentials, error) {
 	if c.safetyMargin, ok = positiveField(fields, "safety_margin_neurons", defaultSafetyMargin); !ok {
 		return c, invalidAuth()
 	}
+	// Capped at a day so the conversion to time.Duration cannot overflow.
 	hold, ok := nonNegativeField(fields, "cold_start_hold_seconds", tallyWindow.Seconds())
-	if !ok {
+	if !ok || hold > 86400 {
 		return c, invalidAuth()
 	}
 	c.coldStartHold = time.Duration(hold * float64(time.Second))
