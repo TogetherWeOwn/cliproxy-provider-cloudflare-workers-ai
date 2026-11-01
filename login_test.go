@@ -77,6 +77,16 @@ func TestAPIKeyLoginWired(t *testing.T) {
 			t.Fatalf("page missing prompt %q", want)
 		}
 	}
+	// The analytics token is a secret: hidden input, like the main API key.
+	// The account ID stays visible.
+	for _, want := range []string{"read -rs PLUGIN_API_KEY", "read -rs PLUGIN_FIELD_ANALYTICS_API_KEY", "read -r PLUGIN_FIELD_ACCOUNT_ID"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing login field wiring %q", want)
+		}
+	}
+	if strings.Contains(body, "read -r PLUGIN_FIELD_ANALYTICS_API_KEY") {
+		t.Fatal("analytics key read with echoing input")
+	}
 	submit, err := p.Login.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "POST",
 		Path: testSubmitPath,
 		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"` + testAccount + `"}`)})

@@ -157,7 +157,7 @@ func newAuthProvider(guard *freeGuard) (*authProvider, error) {
 	// ownership entry.
 	login, err := kit.NewAPIKeyLogin(kit.APIKeyLoginConfig{Provider: provider, Parse: p.ParseAuth, Fields: []kit.APIKeyLoginField{
 		{Name: "account_id", Label: "Account ID", Description: "Cloudflare account ID: 32 lowercase hex characters.", Required: true},
-		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false},
+		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false, Secret: true},
 	}, FilenameFields: []string{"account_id"}})
 	if err != nil {
 		return nil, err
