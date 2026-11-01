@@ -305,8 +305,13 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		chunks.Write(c.Payload)
 	}
-	if !strings.Contains(chunks.String(), "[DONE]") {
-		t.Fatal("stream truncated")
+	// The kit re-frames to one data event per chunk and drops the SSE
+	// [DONE] marker (the host appends its own terminator): the stream ends
+	// by channel close. The core-executor call carries no chat route, so
+	// the chunks stay data-framed.
+	if want := `data: {"id":"chat-example","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` +
+		`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`; chunks.String() != want {
+		t.Fatalf("stream %q want %q", chunks.String(), want)
 	}
 	opts.Stream = false
 	for _, status := range []int{401, 403, 404, 429, 503} {
