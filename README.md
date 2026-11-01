@@ -1,15 +1,18 @@
 # Cloudflare Workers AI provider for CLIProxyAPI
 
 First-class account/token auth files, namespaced model discovery, streaming and
-non-streaming OpenAI chat execution, and a **daily neuron quota card**. Uses the
+non-streaming OpenAI chat execution, a **daily neuron quota card** and a
+**free-only hard stop** that is on by default. Uses the
 [`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `de8b318`
 and the real **CLIProxyAPI v8.0.48** C-ABI loader (ABI 1, RPC schema 9).
 
 Multiple auth files use native routing (`round-robin`, weighted routing or
-fill-first) and native per-auth/model cooldown. There is **no Scheduler**, local
-reservation engine, preemptive quota-based avoidance or background polling.
-Quota is **display-only**, not a billing cap. The plugin never changes a Workers
-plan, enables paid usage, or upgrades an account.
+fill-first) and native per-auth/model cooldown. There is **no Scheduler** and no
+background polling. Before each request is sent, the executor checks the
+account's daily neuron usage. It refuses any request that could go over the
+free daily allocation. If the usage reading is missing or stale, it also
+refuses. See [Free-only hard stop](#free-only-hard-stop). The plugin never
+changes a Workers plan, enables paid usage, or upgrades an account.
 
 **Pending live verification.** All provider tests use loopback mocks. The exact
 account GraphQL schema/permissions and deployed quota UI have not been verified.
@@ -30,6 +33,8 @@ mode `0600`. Never save actual credentials in this repository.
   "api_key": "<workers-ai-api-token>",
   "analytics_api_key": "<optional-separate-analytics-read-token>",
   "daily_free_neurons": 10000,
+  "stay_within_free": true,
+  "safety_margin_neurons": 500,
   "label": "<account-label>",
   "weight": 1,
   "priority": 0,
@@ -44,10 +49,30 @@ mode `0600`. Never save actual credentials in this repository.
   to the same account. If omitted, `api_key` must carry both permissions. The
   inference API does not receive the separate analytics token. Missing analytics
   permission yields an unknown/error card, never a fabricated zero reading or
-  inference-key suspension.
+  inference-key suspension. With `stay_within_free` on, the hard stop then
+  refuses inference (`quota_unverified`), because usage cannot be checked.
 - `daily_free_neurons`: optional positive finite number; default **10,000**, from
-  the official pricing page. This configures the card's capacity, not an upstream
-  allowance or spending cap. Do not increase it to invent free usage.
+  the official pricing page. This sets the card's capacity and the hard stop's
+  ceiling. It does not change the upstream allowance. Do not increase it to
+  invent free usage. When several auths share one account, the hard stop uses
+  the **lowest** value any of them has carried since the plugin loaded.
+- `stay_within_free`: optional boolean; default **true**. Turns on the free-only
+  hard stop. Set it to `false` only for an account where paid usage is
+  approved; the plugin then behaves like v0.1.1 (no usage check before
+  dispatch, no output cap).
+- `cold_start_hold_seconds`: optional number from 0 to 86,400; default **600**
+  (one tally window). After the plugin instance starts (CLIProxy restart or
+  plugin reload), the hard stop refuses with a retryable `rate_limit` for this
+  long, because a new instance cannot see what an earlier one admitted while
+  analytics still lag. Set `0` only where no earlier instance can have
+  admitted requests in the last 10 minutes.
+- `safety_margin_neurons`: optional positive finite number; default **500**.
+  This many neurons are kept unused below `daily_free_neurons`. The margin
+  absorbs estimate errors, sampled analytics and other consumers. A margin at or
+  above the capacity refuses every request. When several auths share one
+  account, the hard stop uses the **highest** margin any of them has carried
+  since the plugin loaded. Raising the capacity or lowering the margin of a
+  shared account takes effect after a plugin reload.
 - Native `prefix`, `proxy_url`, weights, priorities, label and disabled fields
   remain host-owned. An optional auth prefix does not replace the fixed namespace.
 
@@ -86,7 +111,11 @@ without it):
 - At most 8 probes run at once across all discoveries, each bounded to 10 s, the whole validation to
   30 s. Definitive verdicts are cached per account/token digest for 6 h;
   inconclusive models are re-probed on the next discovery.
-- Probes use a negligible number of neurons. The plugin never submits a model
+- Each probe uses only a few neurons. With `stay_within_free` on, each probe goes
+  through the hard stop like inference (charged by the same estimate, with
+  `max_tokens: 1`). A refused probe is not sent, and the model stays listed.
+  A model without a published neuron price is never advertised or served while
+  the hard stop is on: it is dropped from the catalog without a probe. The plugin never submits a model
   license agreement (`agree`) on the operator's behalf; accept it yourself and
   the model is advertised after the cached verdict expires or the plugin reloads.
 
@@ -108,8 +137,13 @@ POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/compl
 Authorization: Bearer <workers-ai-api-token>
 ```
 
-The final host-translated OpenAI payload is preserved except for the model
-prefix and the stream flag, which is set to match the execution method. Streams
+With `stay_within_free: false`, the final host-translated OpenAI payload is
+preserved with two exceptions: the model prefix is removed, and the stream flag
+is set to match the execution method (a raw `HttpRequest` keeps the body's own
+flag). With `stay_within_free` on (the default), the upstream body is
+**rebuilt** from an allowlisted, text-only request shape instead (see
+[Accepted request shape](#accepted-request-shape-with-the-hard-stop-on)); the
+estimate is computed from exactly the rebuilt bytes. Streams
 are relayed incrementally. All inference/discovery requests use the injected
 **host HTTP client**. Arbitrary raw-HTTP destinations, methods and caller
 credentials are not forwarded. Token counting is local and explicitly estimated.
@@ -119,7 +153,7 @@ only for GPT-OSS, with `stream:false`. This plugin does not advertise an embeddi
 executor or a Responses protocol, and does not send requests to those endpoints.
 Clients using other protocols must use the host's chat translation support.
 
-## Daily neuron quota
+## Daily neuron quota and free-only hard stop
 
 The official free allocation is **10,000 neurons per account per day**, resetting
 at **00:00 UTC**, without rollover. The capacity can be configured in the auth
@@ -172,9 +206,144 @@ GraphQL polling has a 15-second timeout, 1 MiB body cap, no redirects, redacted
 errors and no inference side effects. It goes through the auth's `proxy_url`, else the
 host's global `proxy-url`, like inference. Kit v0.1.0's quota helper only supports
 GET, so this provider uses an equivalent bounded client for GraphQL POST.
-Adaptive analytics can be sampled/delayed and other account consumers may exist.
-**This display cannot enforce free-only billing on a Workers Paid account.**
-No automatic reset is supported; UTC rollover is an upstream daily window.
+Adaptive analytics can be sampled or delayed, and other consumers may use the
+same account. The card only displays usage. Enforcement is done by the hard
+stop below. No automatic reset is supported; UTC rollover is an upstream daily
+window.
+
+### Free-only hard stop
+
+On Workers Paid, every neuron above the free daily allocation is billed. With
+`stay_within_free` on (the default), the executor checks each request before
+`Execute`, `ExecuteStream` or raw `HttpRequest` sends it. Catalog validation
+probes are checked the same way. A request is sent only if:
+
+```text
+reading + tally + estimate + safety_margin_neurons < daily_free_neurons
+```
+
+- **reading**: today's (UTC) account-wide `totalNeurons`. It uses the GraphQL
+  query above, sent with the plugin's own bounded analytics client (the one
+  the quota card uses), **not** the host HTTP client of the inference request:
+  that client would record the GraphQL request, analytics bearer token
+  included, in the inference request's API log and count it as an upstream
+  attempt. The read follows the same proxy policy as inference: the auth's
+  `proxy_url`, else the host's global `proxy-url`. The plugin learns the
+  global setting from the host's auth and model requests; until it has seen
+  it, an auth without its own `proxy_url` is refused (`quota_unverified`)
+  rather than read direct. An invalid proxy also fails the read. A per-call
+  proxy override that another plugin passes to a host model execution is not
+  visible to the plugin and does not apply to the read. Each account has one
+  reading, shared by all its
+  tokens. The reading is cached for at most **60 s**, and only one read per
+  account runs at a time. If a refresh fails, a same-day reading up to
+  **2 minutes** old is still used. A reading from before 00:00 UTC is never
+  used after it, and neither is a read that crosses midnight.
+- **tally**: analytics lag. So every request allowed through in the last
+  **10 minutes** stays charged at its estimate, even after a newer reading may
+  already include it. Counting a request twice is safe; missing one is not.
+  Entries from just before midnight still count after it, which is also safe.
+- **estimate**: `ceil(((body_bytes + 512) × input_rate + max_tokens × output_rate) / 1e6)`.
+  `body_bytes` is the length of the rebuilt upstream body, the exact bytes
+  sent; 512 input tokens cover the model's chat template; `max_tokens` is the
+  integer written into that body. The rates are the model's neurons per million
+  tokens from the official
+  [pricing table](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+  (retrieved 2026-11-01). A model not in the table is refused (`invalid_model`,
+  HTTP 400) and not advertised: it cannot be bounded. With text-only content
+  every token is at least one byte, so the body's byte length bounds the
+  prompt tokens; JSON framing only overcounts. Cached input is charged at the
+  uncached rate.
+
+#### Accepted request shape with the hard stop on
+
+The client body is decoded **once**, with exact, case-sensitive keys, and the
+upstream body is re-marshalled from those decoded values. The guard and
+Cloudflare therefore read the same request: there is no second parse of the
+client body in which Go's case-insensitive field matching, Unicode case folding
+(the Kelvin sign `K` U+212A as `k`, long s `ſ` U+017F as `s`) or a duplicate key
+could make the two disagree. Only this text-only shape is accepted; anything
+else is refused before any analytics read or dispatch with `invalid_request`
+(HTTP 400, not retryable, no cooldown):
+
+- **Top-level keys**, exactly: `model`, `messages`, `max_tokens`,
+  `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
+  `stream`, `stream_options` (only `include_usage`, a boolean),
+  `frequency_penalty`, `presence_penalty`, `repetition_penalty`, plus `n` and
+  `best_of` only with the value `1` (not forwarded). Sampling fields must be
+  numbers and `stop` a string or at most 4 strings. `tools`, `tool_choice` and
+  `response_format` are refused: chat templates render tool and schema JSON
+  into far more tokens than its bytes (deeply nested tool parameters measured
+  above 13x), so no body-length estimate bounds them. Any other key (for
+  example `prompt`, `image`, `audio`, `raw`, `lora`, `logprobs`), any case
+  variant (`Max_Tokens`, `max_toKens` with U+212A) and any key given twice is
+  refused.
+- **Messages**: an array of objects with only the keys `role` (string,
+  required), `content` and `name` (string), each at most once, exact case.
+  `tool_calls` and `tool_call_id` are refused for the same reason as `tools`.
+- **Content**: a string, `null`, or an array of parts that are each exactly
+  `{"type":"text","text":<string>}` (no other keys, no case variants).
+  `image_url`, `input_audio`, `file` or any other part is refused: images and
+  audio can expand to far more tokens than their bytes.
+- **Output limit**: `max_tokens` and `max_completion_tokens`, when present and
+  not `null`, must be integers of at least 1 (`0.0001`, `1.5`, `0`, `"5"` and
+  `1e300` are refused). The rebuilt body carries one `max_tokens`: the lower of
+  the two given, else 4,096; `max_completion_tokens` is not forwarded.
+- The rebuilt body contains only these fields with lowercase keys: `model`
+  (prefix removed), `stream` (the execution method's flag; for a raw
+  `HttpRequest`, the body's boolean `stream`), `max_tokens`, the rebuilt
+  `messages`, and the other allowlisted fields re-encoded from their decoded
+  numbers, strings and booleans. Every byte of the rebuilt body is charged as
+  input.
+
+Callers that need another shape need an auth with `stay_within_free: false`,
+which forwards the payload as before; use it only where paid usage is approved.
+
+Refusals never reach Cloudflare:
+
+| Condition | Plugin error | Retry hint |
+| --- | --- | --- |
+| `estimate + safety_margin_neurons >= daily_free_neurons` (cannot fit even at zero usage) | `request_too_large`, HTTP 400 | None; lower `max_tokens` or the prompt |
+| Request shape outside the allowlist (see above) | `invalid_request`, HTTP 400 | None; send the accepted text-only shape |
+| Model without a published neuron price | `invalid_model`, HTTP 400 | None; use a priced model |
+| `reading + estimate + safety_margin_neurons >= daily_free_neurons` (the reading alone leaves no room) | `quota_exhausted`, HTTP 429, non-retryable | Until next 00:00 UTC |
+| Within `cold_start_hold_seconds` of the plugin instance starting | `rate_limit`, HTTP 429, retryable | Until the hold ends (default at most 10 minutes) |
+| Only the tally pushes the check over | `rate_limit`, HTTP 429, retryable | Until the oldest tally entry leaves the 10-minute window (at most 10 minutes) |
+| No reading, failed read, reading older than 2 minutes, unknown host proxy, or read across midnight | `quota_unverified`, HTTP 503 | 60 seconds |
+
+The `quota_exhausted` refusal keeps that auth/model in native cooldown until the
+UTC reset; it is returned only when today's measured usage leaves no room for
+the request. A refusal caused only by recent admissions still in the tally is a
+`rate_limit` whose retry hint is at most 10 minutes, so the host cools the
+auth/model down for minutes, not for the rest of the day. The plugin never
+opens the gate just because analytics might be stale. Set
+`stay_within_free: false` only where paid usage has been approved.
+
+**Overshoot bound.** Two assumptions:
+
+1. Each request costs at most its estimate.
+2. Cloudflare analytics show a request's neurons within **8 minutes** of its
+   admission (the 10-minute tally window minus the 2-minute maximum reading
+   age). This includes the request's run time.
+
+If both hold, every admission keeps the measured usage plus all uncounted
+admissions below `daily_free_neurons − safety_margin_neurons` (9,500 by
+default). So the plugin's own traffic **never exceeds the free allocation**,
+and the whole margin is spare. If the assumptions fail, let `U` be the neurons
+the check could not see. Sources of `U`:
+
+- other consumers of the same account, including a second CLIProxy instance
+  (the tally is per process);
+- adaptive-sampling error in analytics;
+- requests that cost more than their estimate;
+- requests whose neurons take longer than 8 minutes to appear in analytics;
+- admissions lost to a plugin restart, only when `cold_start_hold_seconds` is
+  set below the 10-minute tally window.
+
+The paid overshoot is then at most `max(0, U − safety_margin_neurons)`. At
+the published $0.011 per 1,000 neurons, the default 500-neuron margin covers
+about $0.0055 of unseen usage per day. Run one CLIProxy instance per account,
+or raise the margin to cover the others.
 
 ## Failure classification and host limitation
 
@@ -186,6 +355,10 @@ No automatic reset is supported; UTC rollover is an upstream daily window.
 | 429 / 3036 or daily-neuron-limit wording | `quota_exhausted` | Until next UTC reset; shorter gateway hints cannot shorten it |
 | 429 / 3040 or other rate/capacity 429 | `rate_limit` | 5 seconds, or valid upstream `Retry-After` |
 | 408 / 5xx | `upstream_error` | Retryable, honoring `Retry-After` |
+
+The free-only hard stop's own refusals (`invalid_request`, `request_too_large`,
+`quota_exhausted` and `rate_limit` before dispatch, `quota_unverified`) are
+listed in [Free-only hard stop](#free-only-hard-stop).
 
 Daily hints can be extended by a longer upstream `Retry-After`. Bodies, account
 IDs, tokens and transport diagnostics never appear in public plugin errors.
@@ -215,7 +388,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.1_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.1.2_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.
@@ -233,6 +406,8 @@ loopback mock upstreams and is **test-only**; never release that binary.
   reporting on a separately authorized isolated staging CLIProxy.
 - Verify native auth/quota UI and UTC reset behavior without deliberately draining
   an account. Confirm any existing paid-plan exposure before inference.
+- Measure the real analytics delay for the account. Confirm it stays under the
+  hard stop's 8-minute assumption before relying on the zero-overshoot bound.
 - Resolve the upstream RPC transient-marker gap and update the pinned host test
   before claiming full native parity or recommending live cutover.
 - Obtain an independent review and publish reviewed release assets before store

@@ -18,10 +18,12 @@ type catalog struct {
 	// probes is shared by every discovery so overlapping ModelsForAuth calls
 	// stay within probeConcurrency in total.
 	probes chan struct{}
+	// guard admits each validation probe like inference.
+	guard *freeGuard
 }
 
-func newCatalog() catalog {
-	return catalog{cache: newVerdictCache(), probes: make(chan struct{}, probeConcurrency)}
+func newCatalog(guard *freeGuard) catalog {
+	return catalog{cache: newVerdictCache(), probes: make(chan struct{}, probeConcurrency), guard: guard}
 }
 
 func modelInfo(id string) pluginapi.ModelInfo {
@@ -35,10 +37,12 @@ func fallbackModels() []pluginapi.ModelInfo {
 func (catalog) RegisterModels(context.Context, pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
 	return pluginapi.ModelRegistrationResponse{Provider: provider, Models: fallbackModels()}, nil
 }
-func (catalog) StaticModels(context.Context, pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+func (cat catalog) StaticModels(_ context.Context, r pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+	cat.guard.observeHost(r.Host)
 	return pluginapi.ModelResponse{Provider: provider, Models: fallbackModels()}, nil
 }
 func (cat catalog) ModelsForAuth(ctx context.Context, r pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
+	cat.guard.observeHost(r.Host)
 	c, err := credentialsFrom(r.StorageJSON, r.Metadata)
 	if err != nil {
 		return pluginapi.ModelResponse{}, err

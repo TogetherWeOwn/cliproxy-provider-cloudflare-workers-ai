@@ -14,8 +14,27 @@ import (
 
 type executor struct{ kit.Passthrough }
 
-func newExecutor() executor {
-	return executor{kit.Passthrough{Provider: provider, BuildRequest: buildRequest, PrepareHTTP: prepareHTTP, ClassifyError: func(r pluginapi.HTTPResponse) error { return classifyFailure(r, time.Now()) }}}
+// Every dispatch path (Execute, ExecuteStream, HttpRequest) builds its upstream
+// request here, so the free-only guard admits each one before it is sent.
+func newExecutor(guard *freeGuard) executor {
+	build := func(ctx context.Context, r pluginapi.ExecutorRequest, stream *bool) (pluginapi.HTTPRequest, error) {
+		req, c, estimate, err := upstreamRequest(r, stream)
+		if err != nil {
+			return pluginapi.HTTPRequest{}, err
+		}
+		if err = guard.admit(ctx, c, estimate); err != nil {
+			return pluginapi.HTTPRequest{}, err
+		}
+		return req, nil
+	}
+	execute := func(ctx context.Context, r pluginapi.ExecutorRequest) (pluginapi.HTTPRequest, error) {
+		return build(ctx, r, &r.Stream)
+	}
+	// Raw HTTP requests keep the stream flag of the body they carry.
+	prepare := func(ctx context.Context, r pluginapi.ExecutorHTTPRequest) (pluginapi.HTTPRequest, error) {
+		return build(ctx, httpExecutorRequest(r), nil)
+	}
+	return executor{kit.Passthrough{Provider: provider, BuildRequest: execute, PrepareHTTP: prepare, ClassifyError: func(r pluginapi.HTTPResponse) error { return classifyFailure(r, time.Now()) }}}
 }
 func (e executor) Execute(ctx context.Context, r pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	r.Stream = false
@@ -31,30 +50,77 @@ func accountBase(c credentials) string {
 func validModel(id string) bool {
 	return strings.HasPrefix(id, "@cf/") && len(id) > len("@cf/") && !strings.ContainsAny(id, " \r\n\t?#\\")
 }
-func buildRequest(_ context.Context, r pluginapi.ExecutorRequest) (pluginapi.HTTPRequest, error) {
+func invalidModel() *pluginabi.Error {
+	return &pluginabi.Error{Code: "invalid_model", Message: "expected a cloudflare/@cf/ model", HTTPStatus: http.StatusBadRequest}
+}
+
+// upstreamRequest builds the chat request and, while stay_within_free is on,
+// its neuron estimate. stream nil keeps the body's own stream flag.
+func upstreamRequest(r pluginapi.ExecutorRequest, stream *bool) (pluginapi.HTTPRequest, credentials, float64, error) {
 	c, err := credentialsFrom(r.StorageJSON, r.AuthMetadata)
 	if err != nil {
-		return pluginapi.HTTPRequest{}, err
+		return pluginapi.HTTPRequest{}, c, 0, err
 	}
+	var raw []byte
+	estimate := 0.0
+	if c.stayWithinFree {
+		raw, estimate, err = guardedRequest(r.Payload, stream)
+	} else {
+		raw, err = passthroughRequest(r.Payload, stream)
+	}
+	if err != nil {
+		return pluginapi.HTTPRequest{}, c, 0, err
+	}
+	return pluginapi.HTTPRequest{Method: http.MethodPost, URL: accountBase(c) + "/v1/chat/completions", Headers: http.Header{"Authorization": {"Bearer " + c.token}, "Content-Type": {"application/json"}}, Body: raw}, c, estimate, nil
+}
+
+// guardedRequest decodes the client body once (see freebody.go) and returns
+// the rebuilt upstream body with the estimate charged for exactly those bytes.
+func guardedRequest(payload []byte, stream *bool) ([]byte, float64, error) {
+	fields, err := strictObject(payload, guardedFields, "request")
+	if err != nil {
+		return nil, 0, err
+	}
+	model, ok := decodeString(fields["model"])
+	if !ok || !strings.HasPrefix(model, modelPrefix) || !validModel(strings.TrimPrefix(model, modelPrefix)) {
+		return nil, 0, invalidModel()
+	}
+	model = strings.TrimPrefix(model, modelPrefix)
+	rate, priced := neuronRates[model]
+	if !priced {
+		return nil, 0, &pluginabi.Error{Code: "invalid_model", Message: "model has no published neuron price, so it cannot be bounded to the free allocation while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
+	}
+	streaming := false
+	if stream != nil {
+		streaming = *stream
+	} else if value, present := fields["stream"]; present && !isNull(value) && json.Unmarshal(value, &streaming) != nil {
+		return nil, 0, guardedRequestError("stream must be a boolean")
+	}
+	body, limit, err := guardedBody(fields, model, streaming)
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, estimateNeurons(rate, body, limit), nil
+}
+
+// passthroughRequest is the opted-out path: the client body with the model
+// prefix removed and, outside raw HTTP requests, the dispatch stream flag.
+func passthroughRequest(payload []byte, stream *bool) ([]byte, error) {
 	var body map[string]json.RawMessage
-	if json.Unmarshal(r.Payload, &body) != nil || body == nil {
-		return pluginapi.HTTPRequest{}, &pluginabi.Error{Code: "invalid_request", Message: "payload must be a JSON object", HTTPStatus: 400}
+	if json.Unmarshal(payload, &body) != nil || body == nil {
+		return nil, &pluginabi.Error{Code: "invalid_request", Message: "payload must be a JSON object", HTTPStatus: 400}
 	}
 	var model string
 	if json.Unmarshal(body["model"], &model) != nil || !strings.HasPrefix(model, modelPrefix) || !validModel(strings.TrimPrefix(model, modelPrefix)) {
-		return pluginapi.HTTPRequest{}, &pluginabi.Error{Code: "invalid_model", Message: "expected a cloudflare/@cf/ model", HTTPStatus: 400}
+		return nil, invalidModel()
 	}
 	body["model"], _ = json.Marshal(strings.TrimPrefix(model, modelPrefix))
-	body["stream"], _ = json.Marshal(r.Stream)
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return pluginapi.HTTPRequest{}, err
+	if stream != nil {
+		body["stream"], _ = json.Marshal(*stream)
 	}
-	return pluginapi.HTTPRequest{Method: http.MethodPost, URL: accountBase(c) + "/v1/chat/completions", Headers: http.Header{"Authorization": {"Bearer " + c.token}, "Content-Type": {"application/json"}}, Body: raw}, nil
+	return json.Marshal(body)
 }
-func prepareHTTP(ctx context.Context, r pluginapi.ExecutorHTTPRequest) (pluginapi.HTTPRequest, error) {
+func httpExecutorRequest(r pluginapi.ExecutorHTTPRequest) pluginapi.ExecutorRequest {
 	// Do not trust raw URLs, methods, caller credentials or extra headers.
-	var input struct{ Stream bool }
-	_ = json.Unmarshal(r.Body, &input)
-	return buildRequest(ctx, pluginapi.ExecutorRequest{Payload: r.Body, Stream: input.Stream, StorageJSON: r.StorageJSON, AuthMetadata: r.Metadata})
+	return pluginapi.ExecutorRequest{Payload: r.Body, StorageJSON: r.StorageJSON, AuthMetadata: r.Metadata, HTTPClient: r.HTTPClient}
 }

@@ -6,6 +6,7 @@ package hostcompat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,6 +37,14 @@ const model = "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"
 
 var account = strings.Repeat("a", 32)
 
+// exhausted is a second mock account whose analytics already show 9,900 of
+// 10,000 free neurons, so the free-only guard must refuse before dispatch.
+var exhausted = strings.Repeat("c", 32)
+
+// busy is a third mock account at 6,000 neurons: one large request fits, and
+// the next is refused by the in-process tally alone.
+var busy = strings.Repeat("d", 32)
+
 type executors map[string]coreauth.ProviderExecutor
 
 func (m executors) Executor(p string) (coreauth.ProviderExecutor, bool) { e, ok := m[p]; return e, ok }
@@ -47,8 +57,43 @@ func (models) RegisterClient(string, string, []*registry.ModelInfo) {}
 func (models) UnregisterClient(string)                              {}
 func (models) GetModelProviders(string) []string                    { return nil }
 func authJSON(key string) []byte {
-	raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": account, "api_key": key, "analytics_api_key": "analytics-key", "label": "Example"})
+	// cold_start_hold_seconds 0: the plugin instance starts inside the test, so
+	// the default hold would refuse every request it makes.
+	raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": account, "api_key": key, "analytics_api_key": "analytics-key", "label": "Example", "cold_start_hold_seconds": 0})
 	return raw
+}
+
+// fixture reads mock directives from the first message. They travel in the
+// content because the free-only guard forwards only allowlisted fields.
+type fixture struct {
+	status                 int
+	daily, firstOnly, gate bool
+}
+
+func fixtureOf(body map[string]any) (fx fixture) {
+	messages, _ := body["messages"].([]any)
+	if len(messages) == 0 {
+		return fx
+	}
+	first, _ := messages[0].(map[string]any)
+	content, _ := first["content"].(string)
+	words := strings.Fields(content)
+	if len(words) == 0 || words[0] != "fixture" {
+		return fx
+	}
+	for _, word := range words[1:] {
+		switch {
+		case strings.HasPrefix(word, "status="):
+			fx.status, _ = strconv.Atoi(strings.TrimPrefix(word, "status="))
+		case word == "daily":
+			fx.daily = true
+		case word == "first_only":
+			fx.firstOnly = true
+		case word == "gate":
+			fx.gate = true
+		}
+	}
+	return fx
 }
 
 // Real v8.0.48 dlopen, C-ABI registration, RPC dispatch, auth persistence and
@@ -67,10 +112,17 @@ func TestRealHostLoader(t *testing.T) {
 				Query     string
 				Variables map[string]string
 			}
-			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account || !strings.Contains(wire.Query, "totalNeurons") {
+			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account && wire.Variables["account"] != exhausted && wire.Variables["account"] != busy || !strings.Contains(wire.Query, "totalNeurons") {
 				t.Error("bad GraphQL query")
 			}
-			io.WriteString(w, `{"data":{"viewer":{"accounts":[{"accountTag":"`+account+`","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":7500}}]}]}}}`)
+			used := "7500"
+			switch wire.Variables["account"] {
+			case exhausted:
+				used = "9900"
+			case busy:
+				used = "6000"
+			}
+			io.WriteString(w, `{"data":{"viewer":{"accounts":[{"accountTag":"`+wire.Variables["account"]+`","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":`+used+`}}]}]}}}`)
 		case "/client/v4/accounts/" + account + "/ai/models/search":
 			if r.Header.Get("Authorization") != "Bearer example-key" || r.URL.Query().Get("task") != "Text Generation" {
 				t.Error("bad discovery request")
@@ -88,14 +140,15 @@ func TestRealHostLoader(t *testing.T) {
 				w.WriteHeader(400)
 				return
 			}
-			if status, ok := body["fixture_status"].(float64); ok && !(body["fixture_first_only"] == true && token == "Bearer second-key") {
-				if status == 429 {
+			fx := fixtureOf(body)
+			if fx.status != 0 && !(fx.firstOnly && token == "Bearer second-key") {
+				if fx.status == 429 {
 					w.Header().Set("Retry-After", "7")
 				}
-				w.WriteHeader(int(status))
-				if body["fixture_daily"] == true {
+				w.WriteHeader(fx.status)
+				if fx.daily {
 					io.WriteString(w, `{"errors":[{"code":3036,"message":"daily neuron allocation exhausted"}]}`)
-				} else if status == 429 {
+				} else if fx.status == 429 {
 					io.WriteString(w, `{"errors":[{"code":3040,"message":"Capacity temporarily exceeded"}]}`)
 				} else {
 					io.WriteString(w, `{"error":"fixture failure"}`)
@@ -106,7 +159,7 @@ func TestRealHostLoader(t *testing.T) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				io.WriteString(w, "data: {\"id\":\"chat-example\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
 				w.(http.Flusher).Flush()
-				if body["fixture_gate"] == true {
+				if fx.gate {
 					select {
 					case <-gate:
 					case <-r.Context().Done():
@@ -118,6 +171,12 @@ func TestRealHostLoader(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, `{"id":"chat-example","object":"chat.completion","model":"@cf/meta/llama-3.1-8b-instruct-fp8","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+		case "/client/v4/accounts/" + busy + "/ai/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"chat-busy","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+		case "/client/v4/accounts/" + exhausted + "/ai/v1/chat/completions":
+			t.Error("request dispatched past the free-only guard")
+			w.WriteHeader(500)
 		default:
 			t.Errorf("unexpected provider path %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -163,7 +222,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.1" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.2" {
 		t.Fatalf("metadata %+v", info)
 	}
 	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
@@ -223,7 +282,7 @@ func TestRealHostLoader(t *testing.T) {
 	if err != nil || !strings.Contains(string(resp.Payload), `"content":"hello"`) || !strings.Contains(string(resp.Payload), `"total_tokens":5`) {
 		t.Fatalf("execute %s %v", resp.Payload, err)
 	}
-	req.Payload = []byte(`{"model":"` + model + `","fixture_gate":true,"messages":[{"role":"user","content":"hello"}]}`)
+	req.Payload = []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"fixture gate"}]}`)
 	opts.Stream = true
 	stream, err := ex.ExecuteStream(ctx, auth, req, opts)
 	if err != nil {
@@ -251,7 +310,7 @@ func TestRealHostLoader(t *testing.T) {
 	}
 	opts.Stream = false
 	for _, status := range []int{401, 403, 404, 429, 503} {
-		raw, _ := json.Marshal(map[string]any{"model": model, "fixture_status": status})
+		raw, _ := json.Marshal(map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": fmt.Sprintf("fixture status=%d", status)}}})
 		req.Payload = raw
 		_, err = ex.Execute(ctx, auth, req, opts)
 		e, ok := err.(interface{ StatusCode() int })
@@ -289,7 +348,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		before := time.Now().UTC()
 		reset := time.Date(before.Year(), before.Month(), before.Day()+1, 0, 0, 0, 0, time.UTC)
-		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","fixture_status":429,"fixture_daily":true,"fixture_first_only":true}`)}
+		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"fixture status=429 daily first_only"}]}`)}
 		if _, err = mgr.Execute(ctx, []string{provider}, call, opts); err != nil {
 			t.Fatalf("sibling rotation %v", err)
 		}
@@ -301,6 +360,72 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		if healthy.Unavailable || healthy.Quota.Exceeded {
 			t.Fatal("healthy sibling impaired")
+		}
+	})
+	t.Run("free-only guard refuses before dispatch until UTC reset", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": exhausted, "api_key": "example-key", "analytics_api_key": "analytics-key", "cold_start_hold_seconds": 0})
+		spent, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "exhausted.json", RawJSON: raw})
+		if err != nil || !handled || spent == nil {
+			t.Fatal(err)
+		}
+		mgr := coreauth.NewManager(nil, nil, nil)
+		mgr.SetRetryConfig(0, 0, 1)
+		mgr.RegisterExecutor(ex)
+		spent = spent.Clone()
+		spent.ID = "exhausted-auth"
+		spent.Status = coreauth.StatusActive
+		if _, err = mgr.Register(ctx, spent); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(spent.ID, spent.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(spent.ID) })
+		before := time.Now().UTC()
+		reset := time.Date(before.Year(), before.Month(), before.Day()+1, 0, 0, 0, 0, time.UTC)
+		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hello"}]}`)}, opts)
+		if e, ok := err.(interface{ StatusCode() int }); !ok || e.StatusCode() != 429 {
+			t.Fatalf("guard refusal %T %v", err, err)
+		}
+		got, _ := mgr.GetByID(spent.ID)
+		state := got.ModelStates[model]
+		if state == nil || !state.Quota.Exceeded || state.NextRetryAfter.Before(reset) || state.NextRetryAfter.After(reset.Add(3*time.Second)) {
+			t.Fatalf("guard refusal lost the UTC reset hint %+v", state)
+		}
+	})
+	t.Run("tally-only guard refusal cools down minutes, not until UTC reset", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": busy, "api_key": "example-key", "analytics_api_key": "analytics-key", "cold_start_hold_seconds": 0})
+		pending, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "busy.json", RawJSON: raw})
+		if err != nil || !handled || pending == nil {
+			t.Fatal(err)
+		}
+		mgr := coreauth.NewManager(nil, nil, nil)
+		mgr.SetRetryConfig(0, 0, 1)
+		mgr.RegisterExecutor(ex)
+		pending = pending.Clone()
+		pending.ID = "busy-auth"
+		pending.Status = coreauth.StatusActive
+		if _, err = mgr.Register(ctx, pending); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(pending.ID, pending.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(pending.ID) })
+		// About 2,615 neurons each: 6000 + 2615 + 500 fits, a second one only
+		// fails because the first is still in the tally.
+		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","max_tokens":100000,"messages":[{"role":"user","content":"hello"}]}`)}
+		if _, err = mgr.Execute(ctx, []string{provider}, call, opts); err != nil {
+			t.Fatalf("first request %v", err)
+		}
+		before := time.Now()
+		_, err = mgr.Execute(ctx, []string{provider}, call, opts)
+		if e, ok := err.(interface{ StatusCode() int }); !ok || e.StatusCode() != 429 {
+			t.Fatalf("tally refusal %T %v", err, err)
+		}
+		if hint, ok := err.(interface{ RetryAfter() *time.Duration }); !ok || hint.RetryAfter() == nil || *hint.RetryAfter() <= 0 || *hint.RetryAfter() > 10*time.Minute {
+			t.Fatalf("tally refusal retry hint %v", err)
+		}
+		got, _ := mgr.GetByID(pending.ID)
+		state := got.ModelStates[model]
+		if state == nil || !state.NextRetryAfter.After(before) || state.NextRetryAfter.After(before.Add(10*time.Minute+3*time.Second)) {
+			t.Fatalf("tally refusal locked the model too long %+v", state)
 		}
 	})
 	t.Run("pinned host transient 429 marker limitation", func(t *testing.T) {
@@ -315,7 +440,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		registry.GetGlobalRegistry().RegisterClient(one.ID, one.Provider, []*registry.ModelInfo{{ID: model}})
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(one.ID) })
-		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","fixture_status":429}`)}, opts)
+		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"fixture status=429"}]}`)}, opts)
 		if err == nil {
 			t.Fatal("rate failure disappeared")
 		}
@@ -333,7 +458,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.1" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.2" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }

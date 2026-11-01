@@ -24,7 +24,27 @@ auth-directory watcher.
 3. Record today's callers and model IDs routed to Cloudflare, and how quota is
    displayed today, so the cutover can be compared.
 4. Confirm the account plan. On Workers Paid, usage above 10,000 neurons/day is
-   billed; this plugin's card is display-only and cannot cap spend.
+   billed. The plugin's free-only hard stop (`stay_within_free`, default on)
+   refuses requests that could exceed the free allocation, and refuses when
+   usage cannot be verified. Read its overshoot bound in the README. Keep it on
+   unless paid usage is approved.
+5. With the hard stop on, only the allowlisted text-only request shape is
+   accepted, and the upstream body is rebuilt from it (README, "Accepted
+   request shape with the hard stop on"). Check today's callers against what
+   it refuses with HTTP 400 `invalid_request`: any top-level key outside the
+   allowlist (for example `prompt`, `image`, `audio`, `logprobs`), any key in
+   another case or given twice, `tools`, `tool_choice`, `response_format`,
+   message keys other than `role`, `content` and `name` (so `tool_calls` and
+   `tool_call_id` too), non-numeric sampling fields, a `stop` that is not a
+   string or at most 4 strings, content parts other than exactly
+   `{"type":"text","text":...}` (image, audio and file parts), a
+   `max_tokens`/`max_completion_tokens` that is not an integer of at least 1,
+   and `n`/`best_of` other than 1. Models without a published neuron price are
+   refused with HTTP 400 `invalid_model` and not advertised. Move such callers
+   to an auth with `stay_within_free: false` only where paid usage is
+   approved. A refusal caused only by recent admissions is a retryable 429
+   `rate_limit` (at most 10 minutes); only a measured reading that leaves no
+   room returns `quota_exhausted` until 00:00 UTC.
 
 ## 2. Create an isolated staging instance
 
@@ -70,9 +90,13 @@ For each distinct account/token pair, write **one** private auth file (mode
 - `account_id`: the 32-hex ID taken from the old `base-url`.
 - `api_key`: the old `api-key` value (a Workers AI Read/Write API token).
 - `analytics_api_key`: optional separate token with Account Analytics Read;
-  add one if the inference token lacks that permission, otherwise the quota
-  card shows an analytics error (inference keeps working).
+  add one if the inference token lacks that permission. Without it, the quota
+  card shows an analytics error and, with `stay_within_free` on, inference is
+  refused (`quota_unverified`) because usage cannot be checked.
 - `daily_free_neurons`: omit to use 10,000.
+- `stay_within_free` / `safety_margin_neurons`: omit to use `true` / 500.
+  Auths on one account share the lowest `daily_free_neurons` and the highest
+  `safety_margin_neurons` among them, so give them the same values.
 
 Do not set `id`; identity is derived from account ID + token. Several tokens
 on one account share **one** daily allocation; each card will show the same
@@ -94,7 +118,9 @@ authorization and are performed by an operator, not by this repository:
 3. Model list contains only `cloudflare/@cf/...` IDs; the executor sends the
    unprefixed `@cf/...` ID upstream.
 4. One small non-stream and one small stream chat request; usage tokens are
-   reported. Do not intentionally drain the daily allocation.
+   reported. Do not intentionally drain the daily allocation. If the auth or
+   host uses a proxy, confirm the analytics read leaves through it and that
+   the request API log of an inference request holds no GraphQL request.
 5. With two auth files on different accounts, a mock or naturally occurring
    3036 cools down only the affected auth until 00:00 UTC while the sibling
    keeps serving.
