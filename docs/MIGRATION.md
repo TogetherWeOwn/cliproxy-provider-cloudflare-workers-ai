@@ -33,8 +33,10 @@ auth-directory watcher.
    request shape with the hard stop on"). Check today's callers against what
    it refuses with HTTP 400 `invalid_request`: any top-level key outside the
    allowlist (for example `prompt`, `image`, `audio`, `logprobs`), any key in
-   another case or given twice, message keys other than `role`, `content`,
-   `name`, `tool_calls`, `tool_call_id`, content parts other than exactly
+   another case or given twice, `tools`, `tool_choice`, `response_format`,
+   message keys other than `role`, `content` and `name` (so `tool_calls` and
+   `tool_call_id` too), non-numeric sampling fields, a `stop` that is not a
+   string or at most 4 strings, content parts other than exactly
    `{"type":"text","text":...}` (image, audio and file parts), a
    `max_tokens`/`max_completion_tokens` that is not an integer of at least 1,
    and `n`/`best_of` other than 1. Models without a published neuron price are

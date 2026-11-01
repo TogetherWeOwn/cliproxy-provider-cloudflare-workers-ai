@@ -262,15 +262,19 @@ else is refused before any analytics read or dispatch with `invalid_request`
 
 - **Top-level keys**, exactly: `model`, `messages`, `max_tokens`,
   `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
-  `stream`, `stream_options`, `frequency_penalty`, `presence_penalty`,
-  `repetition_penalty`, `response_format`, `tools`, `tool_choice`, plus `n` and
-  `best_of` only with the value `1` (not forwarded). Any other key (for
+  `stream`, `stream_options` (only `include_usage`, a boolean),
+  `frequency_penalty`, `presence_penalty`, `repetition_penalty`, plus `n` and
+  `best_of` only with the value `1` (not forwarded). Sampling fields must be
+  numbers and `stop` a string or at most 4 strings. `tools`, `tool_choice` and
+  `response_format` are refused: chat templates render tool and schema JSON
+  into far more tokens than its bytes (deeply nested tool parameters measured
+  above 13x), so no body-length estimate bounds them. Any other key (for
   example `prompt`, `image`, `audio`, `raw`, `lora`, `logprobs`), any case
   variant (`Max_Tokens`, `max_toKens` with U+212A) and any key given twice is
   refused.
 - **Messages**: an array of objects with only the keys `role` (string,
-  required), `content`, `name` (string), `tool_calls` (array) and
-  `tool_call_id` (string), each at most once, exact case.
+  required), `content` and `name` (string), each at most once, exact case.
+  `tool_calls` and `tool_call_id` are refused for the same reason as `tools`.
 - **Content**: a string, `null`, or an array of parts that are each exactly
   `{"type":"text","text":<string>}` (no other keys, no case variants).
   `image_url`, `input_audio`, `file` or any other part is refused: images and
@@ -282,8 +286,9 @@ else is refused before any analytics read or dispatch with `invalid_request`
 - The rebuilt body contains only these fields with lowercase keys: `model`
   (prefix removed), `stream` (the execution method's flag; for a raw
   `HttpRequest`, the body's boolean `stream`), `max_tokens`, the rebuilt
-  `messages`, and the other allowlisted fields' decoded JSON values. Every byte
-  of those values is charged as input.
+  `messages`, and the other allowlisted fields re-encoded from their decoded
+  numbers, strings and booleans. Every byte of the rebuilt body is charged as
+  input.
 
 Callers that need another shape need an auth with `stay_within_free: false`,
 which forwards the payload as before; use it only where paid usage is approved.
@@ -304,8 +309,7 @@ UTC reset; it is returned only when today's measured usage leaves no room for
 the request. A refusal caused only by recent admissions still in the tally is a
 `rate_limit` whose retry hint is at most 10 minutes, so the host cools the
 auth/model down for minutes, not for the rest of the day. The plugin never
-opens the gate just because analytics might be stale. Set
-`stay_within_free: false` only where paid usage has been approved.
+opens the gate just because analytics might be stale.
 
 **Overshoot bound.** Two assumptions:
 

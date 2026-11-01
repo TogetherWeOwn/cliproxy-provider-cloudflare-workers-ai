@@ -70,8 +70,8 @@ func TestGuardedBodyIsRebuiltAndChargedExactly(t *testing.T) {
 		// An escaped key decodes to the exact name; the rebuilt body carries
 		// the decoded value under the plain key, so both sides read 5.
 		{`,"max\u005ftokens":5`, 5},
-		{`,"n":1,"best_of":1,"temperature":0.2,"top_p":0.9,"top_k":40,"seed":7,"stop":["\n"],"frequency_penalty":0.1,"presence_penalty":0.1,"repetition_penalty":1.1,"response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"f","parameters":{}}}],"tool_choice":"auto","stream_options":{"include_usage":true},` +
-			`"messages":[{"role":"system","content":"be brief"},{"role":"user","name":"u","content":[{"type":"text","text":"hi"},{"text":"there","type":"text"}]},{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"ok"}]`, defaultMaxOutputTokens},
+		{`,"n":1,"best_of":1,"temperature":0.2,"top_p":0.9,"top_k":40,"seed":7,"stop":["\n"],"frequency_penalty":0.1,"presence_penalty":0.1,"repetition_penalty":1.1,"stream_options":{"include_usage":true},` +
+			`"messages":[{"role":"system","content":"be brief"},{"role":"user","name":"u","content":[{"type":"text","text":"hi"},{"text":"there","type":"text"}]},{"role":"assistant","content":null},{"role":"user","content":"ok"}]`, defaultMaxOutputTokens},
 	} {
 		rec := newChatRecorder(t)
 		g := testGuard(rec.server)
@@ -123,6 +123,36 @@ func TestGuardedBodyIsRebuiltAndChargedExactly(t *testing.T) {
 }
 
 func mustJSON(v any) []byte { raw, _ := json.Marshal(v); return raw }
+
+// Chat templates render structured fields (tools, response_format schemas,
+// tool calls) into far more tokens than their bytes, and nested scalars could
+// be re-read differently upstream, so the hard stop refuses them outright.
+func TestGuardRefusesStructuredFieldsTheEstimateCannotBound(t *testing.T) {
+	deep := strings.Repeat("[", 800) + "1" + strings.Repeat("]", 800)
+	for _, fields := range []string{
+		`,"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":` + deep + `}}]`,
+		`,"tool_choice":"auto"`,
+		`,"response_format":{"type":"json_object"}`,
+		`,"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}]`,
+		`,"messages":[{"role":"tool","tool_call_id":"c","content":"ok"}]`,
+		`,"temperature":"0.2"`,
+		`,"temperature":[0.2]`,
+		`,"stop":[["\n"]]`,
+		`,"stop":["a","b","c","d","e"]`,
+		`,"stream_options":{"include_usage":"yes"}`,
+		`,"stream_options":{"include_Usage":true}`,
+	} {
+		rec := newChatRecorder(t)
+		ex := newExecutor(testGuard(rec.server))
+		payload := `{"model":"cloudflare/@cf/meta/llama-3.3-70b-instruct-fp8-fast"` + fields + `}`
+		if e := wantCode(t, execErr(ex, rec.request(payload, nil)), "invalid_request"); e.HTTPStatus != http.StatusBadRequest || e.Retryable {
+			t.Fatalf("%s: refusal %+v", payload, e)
+		}
+		if n := len(rec.sent()); n != 0 {
+			t.Fatalf("%s: %d requests sent upstream", payload, n)
+		}
+	}
+}
 
 func TestGuardedBodyKeepsTextPartsAndExactKeys(t *testing.T) {
 	stream := false
