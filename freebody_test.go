@@ -296,3 +296,18 @@ func TestUnpricedModelsAreNotAdvertisedWhileGuarded(t *testing.T) {
 		}
 	}
 }
+
+// Forwarded numbers keep their exact literal: a seed above 2^53 must not be
+// rounded through float64.
+func TestGuardedBodyKeepsExactNumbers(t *testing.T) {
+	stream := false
+	req, _, _, err := upstreamRequest(pluginapi.ExecutorRequest{StorageJSON: authJSON(testAccount, "example-key"), Payload: []byte(`{"model":"cloudflare/@cf/openai/gpt-oss-20b","seed":9007199254740993,"temperature":2e-1,"stop":[ "a" ],"messages":[{"role":"user","content":"x"}]}`)}, &stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"seed":9007199254740993`, `"temperature":2e-1`, `"stop":["a"]`} {
+		if !bytes.Contains(req.Body, []byte(want)) {
+			t.Fatalf("rebuilt %s lacks %s", req.Body, want)
+		}
+	}
+}

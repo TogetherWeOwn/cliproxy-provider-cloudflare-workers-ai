@@ -57,7 +57,9 @@ func (models) RegisterClient(string, string, []*registry.ModelInfo) {}
 func (models) UnregisterClient(string)                              {}
 func (models) GetModelProviders(string) []string                    { return nil }
 func authJSON(key string) []byte {
-	raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": account, "api_key": key, "analytics_api_key": "analytics-key", "label": "Example"})
+	// cold_start_hold_seconds 0: the plugin instance starts inside the test, so
+	// the default hold would refuse every request it makes.
+	raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": account, "api_key": key, "analytics_api_key": "analytics-key", "label": "Example", "cold_start_hold_seconds": 0})
 	return raw
 }
 
@@ -361,7 +363,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 	})
 	t.Run("free-only guard refuses before dispatch until UTC reset", func(t *testing.T) {
-		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": exhausted, "api_key": "example-key", "analytics_api_key": "analytics-key"})
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": exhausted, "api_key": "example-key", "analytics_api_key": "analytics-key", "cold_start_hold_seconds": 0})
 		spent, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "exhausted.json", RawJSON: raw})
 		if err != nil || !handled || spent == nil {
 			t.Fatal(err)
@@ -390,7 +392,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 	})
 	t.Run("tally-only guard refusal cools down minutes, not until UTC reset", func(t *testing.T) {
-		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": busy, "api_key": "example-key", "analytics_api_key": "analytics-key"})
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": busy, "api_key": "example-key", "analytics_api_key": "analytics-key", "cold_start_hold_seconds": 0})
 		pending, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "busy.json", RawJSON: raw})
 		if err != nil || !handled || pending == nil {
 			t.Fatal(err)

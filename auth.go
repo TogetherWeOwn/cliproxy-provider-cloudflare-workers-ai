@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -32,13 +33,17 @@ type credentials struct {
 	// The free-only hard stop is on unless an auth explicitly opts out.
 	stayWithinFree bool
 	safetyMargin   float64
+	// coldStartHold: after the plugin instance starts, refuse (retryably) for
+	// this long, because a new instance cannot see what an earlier one
+	// admitted while analytics still lag. Default one tally window.
+	coldStartHold time.Duration
 	// proxyURL is the auth's own proxy_url (metadata over storage), empty when
 	// unset; the guard's analytics read falls back to the host's proxy-url.
 	proxyURL string
 }
 
 func invalidAuth() *pluginabi.Error {
-	return &pluginabi.Error{Code: "invalid_auth", Message: "expected an account_id, API token, optional positive daily_free_neurons and safety_margin_neurons, and optional boolean stay_within_free", HTTPStatus: 400}
+	return &pluginabi.Error{Code: "invalid_auth", Message: "expected an account_id, API token, optional positive daily_free_neurons and safety_margin_neurons, optional non-negative cold_start_hold_seconds, and optional boolean stay_within_free", HTTPStatus: 400}
 }
 
 // Validate at every boundary, including host-metadata overlays after persistence.
@@ -75,6 +80,11 @@ func credentialsFields(fields map[string]any) (credentials, error) {
 	if c.safetyMargin, ok = positiveField(fields, "safety_margin_neurons", defaultSafetyMargin); !ok {
 		return c, invalidAuth()
 	}
+	hold, ok := nonNegativeField(fields, "cold_start_hold_seconds", tallyWindow.Seconds())
+	if !ok {
+		return c, invalidAuth()
+	}
+	c.coldStartHold = time.Duration(hold * float64(time.Second))
 	c.stayWithinFree = true
 	if value, exists := fields["stay_within_free"]; exists {
 		if c.stayWithinFree, ok = value.(bool); !ok {
@@ -84,6 +94,14 @@ func credentialsFields(fields map[string]any) (credentials, error) {
 	return c, nil
 }
 func positiveField(fields map[string]any, name string, fallback float64) (float64, bool) {
+	n, ok := numberField(fields, name, fallback)
+	return n, ok && n > 0
+}
+func nonNegativeField(fields map[string]any, name string, fallback float64) (float64, bool) {
+	n, ok := numberField(fields, name, fallback)
+	return n, ok && n >= 0
+}
+func numberField(fields map[string]any, name string, fallback float64) (float64, bool) {
 	value, exists := fields[name]
 	if !exists {
 		return fallback, true
@@ -100,7 +118,7 @@ func positiveField(fields map[string]any, name string, fallback float64) (float6
 	default:
 		return 0, false
 	}
-	return n, n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0)
+	return n, !math.IsNaN(n) && !math.IsInf(n, 0)
 }
 func validToken(token string) bool { return token != "" && !strings.ContainsAny(token, "\r\n\x00") }
 
@@ -138,6 +156,7 @@ func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseReq
 	if err != nil {
 		return pluginapi.AuthParseResponse{}, err
 	}
+	p.guard.observeAuth(c)
 	digest := sha256.Sum256([]byte(c.account + "\x00" + c.token))
 	out.Auth.ID = provider + ":" + hex.EncodeToString(digest[:6])
 	p.mu.Lock()
@@ -153,8 +172,10 @@ func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseReq
 }
 func (p *authProvider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
 	p.guard.observeHost(req.Host)
-	if _, err := credentialsFrom(req.StorageJSON, req.Metadata); err != nil {
+	c, err := credentialsFrom(req.StorageJSON, req.Metadata)
+	if err != nil {
 		return pluginapi.AuthRefreshResponse{}, err
 	}
+	p.guard.observeAuth(c)
 	return p.APIKeyAuth.RefreshAuth(ctx, req)
 }

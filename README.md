@@ -60,6 +60,12 @@ mode `0600`. Never save actual credentials in this repository.
   hard stop. Set it to `false` only for an account where paid usage is
   approved; the plugin then behaves like v0.1.1 (no usage check before
   dispatch, no output cap).
+- `cold_start_hold_seconds`: optional non-negative number; default **600**
+  (one tally window). After the plugin instance starts (CLIProxy restart or
+  plugin reload), the hard stop refuses with a retryable `rate_limit` for this
+  long, because a new instance cannot see what an earlier one admitted while
+  analytics still lag. Set `0` only where no earlier instance can have
+  admitted requests in the last 10 minutes.
 - `safety_margin_neurons`: optional positive finite number; default **500**.
   This many neurons are kept unused below `daily_free_neurons`. The margin
   absorbs estimate errors, sampled analytics and other consumers. A margin at or
@@ -301,6 +307,7 @@ Refusals never reach Cloudflare:
 | Request shape outside the allowlist (see above) | `invalid_request`, HTTP 400 | None; send the accepted text-only shape |
 | Model without a published neuron price | `invalid_model`, HTTP 400 | None; use a priced model |
 | `reading + estimate + safety_margin_neurons >= daily_free_neurons` (the reading alone leaves no room) | `quota_exhausted`, HTTP 429, non-retryable | Until next 00:00 UTC |
+| Within `cold_start_hold_seconds` of the plugin instance starting | `rate_limit`, HTTP 429, retryable | Until the hold ends (default at most 10 minutes) |
 | Only the tally pushes the check over | `rate_limit`, HTTP 429, retryable | Until the oldest tally entry leaves the 10-minute window (at most 10 minutes) |
 | No reading, failed read, reading older than 2 minutes, unknown host proxy, or read across midnight | `quota_unverified`, HTTP 503 | 60 seconds |
 
@@ -330,7 +337,8 @@ the check could not see. Sources of `U`:
 - adaptive-sampling error in analytics;
 - requests that cost more than their estimate;
 - requests whose neurons take longer than 8 minutes to appear in analytics;
-- admissions lost to a plugin restart within 10 minutes.
+- admissions lost to a plugin restart, only when `cold_start_hold_seconds` is
+  set below the 10-minute tally window.
 
 The paid overshoot is then at most `max(0, U − safety_margin_neurons)`. At
 the published $0.011 per 1,000 neurons, the default 500-neuron margin covers

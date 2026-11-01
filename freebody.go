@@ -128,8 +128,16 @@ func guardedBody(fields map[string]json.RawMessage, model string, stream bool) (
 	}
 	for _, field := range numberFields {
 		if raw, ok := fields[field]; ok && !isNull(raw) {
-			var n float64
-			if len(raw) == 0 || raw[0] == '"' || json.Unmarshal(raw, &n) != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+			// json.Number keeps the literal (an exact seed above 2^53), and
+			// re-encoding it writes only the validated digits.
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.UseNumber()
+			var n json.Number
+			// A quoted string would decode into json.Number too.
+			if raw[0] == '"' || dec.Decode(&n) != nil {
+				return nil, 0, guardedRequestError(field + " must be a number")
+			}
+			if f, err := n.Float64(); err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 				return nil, 0, guardedRequestError(field + " must be a number")
 			}
 			out[field], _ = json.Marshal(n)

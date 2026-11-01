@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/TogetherWeOwn/cliproxy-provider-kit/cabi"
@@ -21,6 +22,7 @@ func makePlugin(host kit.Caller) (*kit.Runtime, error) {
 	// per-account readings and admission tally. It reads analytics with the
 	// plugin's own client, never the per-request host client.
 	guard := newFreeGuard(client)
+	guard.started = time.Now()
 	models := newCatalog(guard)
 	return kit.New(kit.Definition{
 		Metadata:  pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai"},

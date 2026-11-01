@@ -555,3 +555,56 @@ func TestEstimateBoundsPromptTemplateAndOutput(t *testing.T) {
 		t.Fatalf("probe estimate %v", got)
 	}
 }
+
+// A new plugin instance has no tally of what an earlier one admitted while
+// analytics lag, so it admits nothing until one tally window has passed.
+func TestGuardWarmUpRefusesRetryably(t *testing.T) {
+	f := &analyticsFixture{}
+	server := f.serve(t)
+	defer server.Close()
+	g := testGuard(server)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	g.now = func() time.Time { return now }
+	g.started = now
+	e := wantCode(t, g.admit(context.Background(), testCredentials(t), 1), "rate_limit")
+	if !e.Retryable || e.RetryAfterSeconds != int(tallyWindow.Seconds()) {
+		t.Fatalf("warm-up refusal %+v", e)
+	}
+	now = now.Add(tallyWindow)
+	if err := g.admit(context.Background(), testCredentials(t), 1); err != nil {
+		t.Fatalf("after warm-up: %v", err)
+	}
+	// An operator may shorten the hold explicitly.
+	now = now.Add(time.Minute)
+	g.started = now
+	c, err := credentialsFrom(authJSON(testAccount, "example-key"), map[string]any{"cold_start_hold_seconds": float64(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.admit(context.Background(), c, 1); err != nil {
+		t.Fatalf("hold 0: %v", err)
+	}
+}
+
+// A stricter auth limits its account as soon as it is parsed, before it
+// serves any request.
+func TestGuardLearnsStricterSettingsAtParse(t *testing.T) {
+	g := newFreeGuard(nil)
+	strict := testCredentials(t)
+	strict.capacity, strict.safetyMargin = 2000, 900
+	g.observeAuth(strict)
+	loose := testCredentials(t)
+	l := g.ledgerLocked(loose)
+	if l.capacity != 2000 || l.margin != 900 {
+		t.Fatalf("ledger %v/%v, want 2000/900", l.capacity, l.margin)
+	}
+}
+
+func testCredentials(t *testing.T) credentials {
+	t.Helper()
+	c, err := credentialsFrom(authJSON(testAccount, "example-key"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}

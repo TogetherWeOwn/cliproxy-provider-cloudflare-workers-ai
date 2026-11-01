@@ -49,8 +49,11 @@ type freeGuard struct {
 	endpoint  string
 	hostProxy atomic.Pointer[string] // host proxy-url; nil until first seen
 	now       func() time.Time
-	mu        sync.Mutex
-	accounts  map[string]*ledger
+	// started is when this plugin instance began (zero in unit tests); see
+	// credentials.coldStartHold.
+	started  time.Time
+	mu       sync.Mutex
+	accounts map[string]*ledger
 }
 
 // One ledger per account: tokens on one account share one allocation, and the
@@ -82,6 +85,29 @@ func (g *freeGuard) observeHost(h pluginapi.HostConfigSummary) {
 		g.hostProxy.Store(&proxy)
 	}
 }
+
+// observeAuth records a parsed or refreshed auth's settings on its account's
+// ledger, so a stricter auth limits the account before it serves a request.
+func (g *freeGuard) observeAuth(c credentials) {
+	if g != nil && c.stayWithinFree {
+		g.mu.Lock()
+		g.ledgerLocked(c)
+		g.mu.Unlock()
+	}
+}
+
+// ledgerLocked returns the account's ledger, folding in c's settings: with
+// several auths on one account, the most permissive must not decide.
+func (g *freeGuard) ledgerLocked(c credentials) *ledger {
+	l := g.accounts[c.account]
+	if l == nil {
+		l = &ledger{capacity: c.capacity, margin: c.safetyMargin}
+		g.accounts[c.account] = l
+	}
+	l.capacity, l.margin = math.Min(l.capacity, c.capacity), math.Max(l.margin, c.safetyMargin)
+	return l
+}
+
 func freeAllowanceError(now time.Time) *pluginabi.Error {
 	return &pluginabi.Error{Code: "quota_exhausted", Message: "request could exceed the Workers AI daily free neuron allocation; refused to avoid paid usage", HTTPStatus: http.StatusTooManyRequests, RetryAfterSeconds: int(math.Ceil(nextReset(now).Sub(now).Seconds()))}
 }
@@ -109,15 +135,12 @@ func (g *freeGuard) admit(ctx context.Context, c credentials, estimate float64) 
 	if g == nil || g.client == nil || !(estimate >= 0) || math.IsInf(estimate, 0) {
 		return usageUnverifiedError()
 	}
+	if until := g.started.Add(c.coldStartHold); !g.started.IsZero() && g.now().Before(until) {
+		return tallyLimitError(until.Sub(g.now()))
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	l := g.accounts[c.account]
-	if l == nil {
-		l = &ledger{capacity: c.capacity, margin: c.safetyMargin}
-		g.accounts[c.account] = l
-	}
-	// Several auths on one account: the most permissive must not decide.
-	l.capacity, l.margin = math.Min(l.capacity, c.capacity), math.Max(l.margin, c.safetyMargin)
+	l := g.ledgerLocked(c)
 	// A request that cannot fit even at zero usage is the request's fault; a
 	// 429 would cool the auth/model down for every smaller request until reset.
 	if estimate+l.margin >= l.capacity {
