@@ -178,7 +178,7 @@ func guardedMessages(raw json.RawMessage) (json.RawMessage, error) {
 			return nil, err
 		}
 		message := make(map[string]json.RawMessage, len(fields))
-		for _, field := range []string{"role", "name", "tool_call_id"} {
+		for _, field := range []string{"role", "name"} {
 			value, present := fields[field]
 			if !present && field != "role" {
 				continue

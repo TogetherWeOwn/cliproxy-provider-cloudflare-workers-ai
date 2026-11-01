@@ -309,7 +309,8 @@ UTC reset; it is returned only when today's measured usage leaves no room for
 the request. A refusal caused only by recent admissions still in the tally is a
 `rate_limit` whose retry hint is at most 10 minutes, so the host cools the
 auth/model down for minutes, not for the rest of the day. The plugin never
-opens the gate just because analytics might be stale.
+opens the gate just because analytics might be stale. Set
+`stay_within_free: false` only where paid usage has been approved.
 
 **Overshoot bound.** Two assumptions:
 
