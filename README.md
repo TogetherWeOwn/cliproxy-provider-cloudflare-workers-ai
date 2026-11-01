@@ -321,6 +321,15 @@ auth/model down for minutes, not for the rest of the day. The plugin never
 opens the gate just because analytics might be stale. Set
 `stay_within_free: false` only where paid usage has been approved.
 
+The `quota_unverified` refusal is shaped so a connector can tell it apart from
+a downstream 429: HTTP 503 (never 429), a 60-second retry hint, and a
+`quota_unverified:` message prefix. The prefix matters because the host renders
+refusals to clients as `{"error": message}` and the plugin error code never
+reaches them; match on the 503 status plus the prefix, since "refused to avoid
+paid usage" alone is shared with `quota_exhausted`. The refusal cools the model
+down briefly and never marks quota exhausted, so a fixable analytics-permission
+problem does not sideline the account until the UTC reset.
+
 **Overshoot bound.** Two assumptions:
 
 1. Each request costs at most its estimate.
@@ -390,7 +399,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.5_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.1.6_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.

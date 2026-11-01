@@ -71,10 +71,10 @@ func normalizeQuota(used, capacity float64, now time.Time) (pluginapi.QuotaFetch
 	return pluginapi.QuotaFetchResponse{
 		Groups: []pluginapi.QuotaGroup{{DisplayName: "Daily free neurons", Buckets: []pluginapi.QuotaBucket{{
 			Window: "daily", RemainingFraction: math.Max(0, 1-used/capacity), ResetTime: nextReset(now).Format(time.RFC3339),
-			Description: fmt.Sprintf("Account-wide analytics: %.6g of %.6g free neurons used today (UTC); delayed and sampled", used, capacity),
+			Description: fmt.Sprintf("Account-wide analytics: %.6g of %.6g configured free neurons used today (UTC); capacity is operator-configured, readings delayed and sampled", used, capacity),
 		}}}},
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "daily_free_neurons", Label: "Daily free allocation", Value: capacity, Unit: "neurons", Format: "number"},
+			{Key: "daily_free_neurons", Label: "Daily free allocation (configured)", Value: capacity, Unit: "neurons", Format: "number"},
 			{Key: "neurons_used_today", Label: "Neurons used today", Value: used, Unit: "neurons", Format: "number"},
 			{Key: "neurons_above_free", Label: "Neurons above free allocation (not an invoice)", Value: math.Max(0, used-capacity), Unit: "neurons", Format: "number"},
 		},

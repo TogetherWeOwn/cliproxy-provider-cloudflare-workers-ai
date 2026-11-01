@@ -45,6 +45,11 @@ var exhausted = strings.Repeat("c", 32)
 // the next is refused by the in-process tally alone.
 var busy = strings.Repeat("d", 32)
 
+// unverified is a fourth mock account whose analytics permission was revoked:
+// usage cannot be checked, so the guard must refuse as quota_unverified (503),
+// never as a downstream-style 429, and must not mark the model quota-exceeded.
+var unverified = strings.Repeat("e", 32)
+
 type executors map[string]coreauth.ProviderExecutor
 
 func (m executors) Executor(p string) (coreauth.ProviderExecutor, bool) { e, ok := m[p]; return e, ok }
@@ -105,8 +110,15 @@ func TestRealHostLoader(t *testing.T) {
 		switch r.URL.Path {
 		case "/client/v4/graphql":
 			polls.Add(1)
-			if r.Method != "POST" || r.Header.Get("Authorization") != "Bearer analytics-key" {
+			if r.Method != "POST" {
 				t.Error("bad analytics request")
+			}
+			if r.Header.Get("Authorization") != "Bearer analytics-key" {
+				// Revoked or missing Analytics Read permission: usage cannot
+				// be checked. The guard must refuse inference as
+				// quota_unverified, never as a 429.
+				w.WriteHeader(http.StatusForbidden)
+				return
 			}
 			var wire struct {
 				Query     string
@@ -222,7 +234,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.5" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.6" {
 		t.Fatalf("metadata %+v", info)
 	}
 	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
@@ -433,6 +445,58 @@ func TestRealHostLoader(t *testing.T) {
 			t.Fatalf("tally refusal locked the model too long %+v", state)
 		}
 	})
+	t.Run("unverified guard refusal stays a 503, never a 429", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": unverified, "api_key": "example-key", "analytics_api_key": "revoked-key", "cold_start_hold_seconds": 0})
+		blind, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "unverified.json", RawJSON: raw})
+		if err != nil || !handled || blind == nil {
+			t.Fatal(err)
+		}
+		blindFile := filepath.Join(cfg.AuthDir, "unverified.json")
+		if err = blind.Storage.SaveTokenToFile(blindFile); err != nil {
+			t.Fatal(err)
+		}
+		blindSaved, err := os.ReadFile(blindFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		quotaAuthID := blind.ID
+		mgr := coreauth.NewManager(nil, nil, nil)
+		mgr.SetRetryConfig(0, 0, 1)
+		mgr.RegisterExecutor(ex)
+		blind = blind.Clone()
+		blind.ID = "unverified-auth"
+		blind.Status = coreauth.StatusActive
+		if _, err = mgr.Register(ctx, blind); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(blind.ID, blind.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(blind.ID) })
+		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hello"}]}`)}, opts)
+		e, ok := err.(interface{ StatusCode() int })
+		if !ok || e.StatusCode() != http.StatusServiceUnavailable {
+			t.Fatalf("guard refusal %T %v", err, err)
+		}
+		// The host reframes the plugin's 60-second hint as a live cooldown
+		// deadline, so only a range can be asserted, not exact equality.
+		if hint, ok := err.(interface{ RetryAfter() *time.Duration }); !ok || hint.RetryAfter() == nil || *hint.RetryAfter() <= 0 || *hint.RetryAfter() > 60*time.Second {
+			t.Fatalf("guard refusal retry hint %v", err)
+		}
+		if msg := err.Error(); !strings.Contains(msg, "quota_unverified") || !strings.Contains(msg, "cannot be verified") {
+			t.Fatalf("guard refusal lost its label %q", msg)
+		}
+		// A 503 guard refusal cools the model down briefly; unlike a 429 it
+		// must never mark quota exhausted (that state waits for the UTC reset
+		// and would sideline the account over a fixable permission problem).
+		got, _ := mgr.GetByID(blind.ID)
+		if state := got.ModelStates[model]; state != nil && state.Quota.Exceeded {
+			t.Fatalf("guard refusal marked quota exhausted %+v", state)
+		}
+		// The quota card fails closed too, so quota sync never reports this
+		// account as healthy while inference refuses.
+		if _, _, err = host.FetchQuota(ctx, pluginapi.QuotaFetchRequest{AuthID: quotaAuthID, Provider: provider, StorageJSON: blindSaved}); err == nil {
+			t.Fatal("quota fetch succeeded despite revoked analytics permission")
+		}
+	})
 	t.Run("pinned host transient 429 marker limitation", func(t *testing.T) {
 		mgr := coreauth.NewManager(nil, nil, nil)
 		mgr.SetRetryConfig(0, 0, 1)
@@ -463,7 +527,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.5" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.6" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }
