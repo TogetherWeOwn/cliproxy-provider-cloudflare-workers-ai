@@ -247,7 +247,7 @@ func TestRealHostLoader(t *testing.T) {
 	quotaReq := pluginapi.QuotaFetchRequest{AuthID: auth.ID, Provider: provider, StorageJSON: saved}
 	for i := 0; i < 2; i++ {
 		quota, handled, err := host.FetchQuota(ctx, quotaReq)
-		if err != nil || !handled || len(quota.Groups) != 1 || quota.Groups[0].Buckets[0].RemainingFraction != .25 || quota.Groups[0].Buckets[0].Window != "daily" || polls.Load() != 1 {
+		if err != nil || !handled || len(quota.Groups) != 1 || quota.Groups[0].Buckets[0].RemainingFraction != .25 || quota.Groups[0].Buckets[0].Window != "Daily free neurons" || quota.Groups[0].Buckets[0].Description != "" || len(quota.Summary) != 0 || polls.Load() != 1 {
 			t.Fatalf("quota %+v %v polls=%d", quota, err, polls.Load())
 		}
 	}

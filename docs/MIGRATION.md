@@ -112,9 +112,12 @@ authorization and are performed by an operator, not by this repository:
 
 1. Auth parse and persistence; duplicate-file rejection; stable auth ID across
    a reload of the same file.
-2. Quota card: one `daily` bucket, reset at the next `00:00:00Z`, usage matching
-   the dashboard's Workers AI usage within analytics delay. If the GraphQL query
-   is rejected, inspect the live schema by introspection before changing code.
+2. Quota card: one `Daily free neurons` bucket with no description, reset at
+   the next `00:00:00Z`, remaining fraction matching the dashboard's Workers
+   AI usage within analytics delay. The summary is empty unless the account is
+   above its free allocation, in which case one `Above free allocation` chip
+   is expected. If the GraphQL query is rejected, inspect the live schema by
+   introspection before changing code.
 3. Model list contains only `cloudflare/@cf/...` IDs; the executor sends the
    unprefixed `@cf/...` ID upstream.
 4. One small non-stream and one small stream chat request; usage tokens are

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -69,16 +68,21 @@ func normalizeQuota(used, capacity float64, now time.Time) (pluginapi.QuotaFetch
 		return pluginapi.QuotaFetchResponse{}, analyticsError("analytics_invalid_data", "invalid neuron usage or daily capacity")
 	}
 	return pluginapi.QuotaFetchResponse{
-		Groups: []pluginapi.QuotaGroup{{DisplayName: "Daily free neurons", Buckets: []pluginapi.QuotaBucket{{
-			Window: "daily", RemainingFraction: math.Max(0, 1-used/capacity), ResetTime: nextReset(now).Format(time.RFC3339),
-			Description: fmt.Sprintf("Account-wide analytics: %.6g of %.6g free neurons used today (UTC); delayed and sampled", used, capacity),
+		Groups: []pluginapi.QuotaGroup{{DisplayName: "Cloudflare Workers AI", Buckets: []pluginapi.QuotaBucket{{
+			Window: "Daily free neurons", RemainingFraction: math.Max(0, 1-used/capacity), ResetTime: nextReset(now).Format(time.RFC3339),
 		}}}},
-		Summary: []pluginapi.QuotaMetric{
-			{Key: "daily_free_neurons", Label: "Daily free allocation", Value: capacity, Unit: "neurons", Format: "number"},
-			{Key: "neurons_used_today", Label: "Neurons used today", Value: used, Unit: "neurons", Format: "number"},
-			{Key: "neurons_above_free", Label: "Neurons above free allocation (not an invoice)", Value: math.Max(0, used-capacity), Unit: "neurons", Format: "number"},
-		},
+		Summary: aboveFree(used, capacity),
 	}, nil
+}
+
+// aboveFree emits the overage chip only when usage exceeds the free
+// allocation. The allocation and used counters repeat the bar, so they stay
+// out of the emitted shape.
+func aboveFree(used, capacity float64) []pluginapi.QuotaMetric {
+	if used <= capacity {
+		return nil
+	}
+	return []pluginapi.QuotaMetric{{Key: "neurons_above_free", Label: "Above free allocation", Value: used - capacity, Unit: "neurons", Format: "number"}}
 }
 
 var _ pluginapi.QuotaProvider = (*quotaProvider)(nil)
