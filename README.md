@@ -75,7 +75,8 @@ mode `0600`. Never save actual credentials in this repository.
   since the plugin loaded. Raising the capacity or lowering the margin of a
   shared account takes effect after a plugin reload.
 - Native `prefix`, `proxy_url`, weights, priorities, label and disabled fields
-  remain host-owned. An optional auth prefix does not replace the fixed namespace.
+  remain host-owned. Fixed model namespace `cloudflare/`; auth `prefix` does
+  not replace it.
 
 Auth ID is `cloudflare-workers-ai:` plus the first 12 hex characters of SHA-256
 of `normalized_account_id + NUL + trimmed_api_key`. User-supplied IDs are rejected.
