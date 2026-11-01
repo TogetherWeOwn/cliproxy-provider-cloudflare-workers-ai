@@ -25,8 +25,9 @@ func makePlugin(host kit.Caller) (*kit.Runtime, error) {
 	guard.started = time.Now()
 	models := newCatalog(guard)
 	return kit.New(kit.Definition{
-		Metadata:  pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai"},
-		Configure: configureBase,
+		Metadata:       pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai"},
+		ModelNamespace: "cloudflare",
+		Configure:      configureBase,
 		Capabilities: pluginapi.Capabilities{
 			AuthProvider: newAuthProvider(guard), ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(guard),
 			ExecutorModelScope:   pluginapi.ExecutorModelScopeBoth,
