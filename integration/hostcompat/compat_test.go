@@ -39,6 +39,10 @@ var account = strings.Repeat("a", 32)
 // 10,000 free neurons, so the free-only guard must refuse before dispatch.
 var exhausted = strings.Repeat("c", 32)
 
+// busy is a third mock account at 6,000 neurons: one large request fits, and
+// the next is refused by the in-process tally alone.
+var busy = strings.Repeat("d", 32)
+
 type executors map[string]coreauth.ProviderExecutor
 
 func (m executors) Executor(p string) (coreauth.ProviderExecutor, bool) { e, ok := m[p]; return e, ok }
@@ -71,12 +75,15 @@ func TestRealHostLoader(t *testing.T) {
 				Query     string
 				Variables map[string]string
 			}
-			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account && wire.Variables["account"] != exhausted || !strings.Contains(wire.Query, "totalNeurons") {
+			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account && wire.Variables["account"] != exhausted && wire.Variables["account"] != busy || !strings.Contains(wire.Query, "totalNeurons") {
 				t.Error("bad GraphQL query")
 			}
 			used := "7500"
-			if wire.Variables["account"] == exhausted {
+			switch wire.Variables["account"] {
+			case exhausted:
 				used = "9900"
+			case busy:
+				used = "6000"
 			}
 			io.WriteString(w, `{"data":{"viewer":{"accounts":[{"accountTag":"`+wire.Variables["account"]+`","aiInferenceAdaptiveGroups":[{"sum":{"totalNeurons":`+used+`}}]}]}}}`)
 		case "/client/v4/accounts/" + account + "/ai/models/search":
@@ -126,6 +133,9 @@ func TestRealHostLoader(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, `{"id":"chat-example","object":"chat.completion","model":"@cf/meta/llama-3.1-8b-instruct-fp8","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+		case "/client/v4/accounts/" + busy + "/ai/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"chat-busy","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
 		case "/client/v4/accounts/" + exhausted + "/ai/v1/chat/completions":
 			t.Error("request dispatched past the free-only guard")
 			w.WriteHeader(500)
@@ -341,6 +351,43 @@ func TestRealHostLoader(t *testing.T) {
 		state := got.ModelStates[model]
 		if state == nil || !state.Quota.Exceeded || state.NextRetryAfter.Before(reset) || state.NextRetryAfter.After(reset.Add(3*time.Second)) {
 			t.Fatalf("guard refusal lost the UTC reset hint %+v", state)
+		}
+	})
+	t.Run("tally-only guard refusal cools down minutes, not until UTC reset", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": busy, "api_key": "example-key", "analytics_api_key": "analytics-key"})
+		pending, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "busy.json", RawJSON: raw})
+		if err != nil || !handled || pending == nil {
+			t.Fatal(err)
+		}
+		mgr := coreauth.NewManager(nil, nil, nil)
+		mgr.SetRetryConfig(0, 0, 1)
+		mgr.RegisterExecutor(ex)
+		pending = pending.Clone()
+		pending.ID = "busy-auth"
+		pending.Status = coreauth.StatusActive
+		if _, err = mgr.Register(ctx, pending); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(pending.ID, pending.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(pending.ID) })
+		// About 2,615 neurons each: 6000 + 2615 + 500 fits, a second one only
+		// fails because the first is still in the tally.
+		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","max_tokens":100000,"messages":[{"role":"user","content":"hello"}]}`)}
+		if _, err = mgr.Execute(ctx, []string{provider}, call, opts); err != nil {
+			t.Fatalf("first request %v", err)
+		}
+		before := time.Now()
+		_, err = mgr.Execute(ctx, []string{provider}, call, opts)
+		if e, ok := err.(interface{ StatusCode() int }); !ok || e.StatusCode() != 429 {
+			t.Fatalf("tally refusal %T %v", err, err)
+		}
+		if hint, ok := err.(interface{ RetryAfter() *time.Duration }); !ok || hint.RetryAfter() == nil || *hint.RetryAfter() <= 0 || *hint.RetryAfter() > 10*time.Minute {
+			t.Fatalf("tally refusal retry hint %v", err)
+		}
+		got, _ := mgr.GetByID(pending.ID)
+		state := got.ModelStates[model]
+		if state == nil || !state.NextRetryAfter.After(before) || state.NextRetryAfter.After(before.Add(10*time.Minute+3*time.Second)) {
+			t.Fatalf("tally refusal locked the model too long %+v", state)
 		}
 	})
 	t.Run("pinned host transient 429 marker limitation", func(t *testing.T) {

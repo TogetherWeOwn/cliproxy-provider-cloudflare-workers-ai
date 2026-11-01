@@ -32,6 +32,9 @@ type credentials struct {
 	// The free-only hard stop is on unless an auth explicitly opts out.
 	stayWithinFree bool
 	safetyMargin   float64
+	// proxyURL is the auth's own proxy_url (metadata over storage), empty when
+	// unset; the guard's analytics read falls back to the host's proxy-url.
+	proxyURL string
 }
 
 func invalidAuth() *pluginabi.Error {
@@ -44,7 +47,9 @@ func credentialsFrom(storage []byte, metadata map[string]any) (credentials, erro
 	if err != nil {
 		return credentials{}, err
 	}
-	return credentialsFields(fields)
+	c, err := credentialsFields(fields)
+	c.proxyURL = kit.AuthProxyURL(storage, metadata, "")
+	return c, err
 }
 func credentialsFields(fields map[string]any) (credentials, error) {
 	var c credentials
@@ -103,13 +108,15 @@ func validToken(token string) bool { return token != "" && !strings.ContainsAny(
 // checks; deleting/renaming an auth file requires a plugin lifecycle reset.
 type authProvider struct {
 	kit.APIKeyAuth
+	guard  *freeGuard
 	mu     sync.Mutex
 	files  map[string][32]byte
 	owners map[[32]byte]string
 }
 
-func newAuthProvider() *authProvider {
-	return &authProvider{APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
+// guard learns the host's global proxy-url from each parse/refresh request.
+func newAuthProvider(guard *freeGuard) *authProvider {
+	return &authProvider{guard: guard, APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
 		if _, ok := fields["id"]; ok {
 			return invalidAuth()
 		}
@@ -122,6 +129,7 @@ func newAuthProvider() *authProvider {
 	}}, files: make(map[string][32]byte), owners: make(map[[32]byte]string)}
 }
 func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+	p.guard.observeHost(req.Host)
 	out, err := p.APIKeyAuth.ParseAuth(ctx, req)
 	if err != nil || !out.Handled {
 		return out, err
@@ -144,6 +152,7 @@ func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseReq
 	return out, nil
 }
 func (p *authProvider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
+	p.guard.observeHost(req.Host)
 	if _, err := credentialsFrom(req.StorageJSON, req.Metadata); err != nil {
 		return pluginapi.AuthRefreshResponse{}, err
 	}

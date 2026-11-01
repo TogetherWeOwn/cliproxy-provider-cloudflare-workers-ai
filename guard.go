@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -28,7 +30,10 @@ import (
 // request whose neurons reached analytics before it, so a request whose
 // neurons appear within tallyWindow-readingMaxAge (8 minutes) of admission is
 // always counted once at least. The tally is in-process; the overshoot bound
-// and its assumptions are documented in the README.
+// and its assumptions are documented in the README. Only a refusal the
+// reading itself forces (reading + estimate + safety_margin reaches the
+// allocation) waits for the UTC reset; one the tally alone forces is a short,
+// retryable rate limit that clears as admissions leave the window.
 const (
 	readingTTL             = 60 * time.Second
 	readingMaxAge          = 2 * time.Minute
@@ -37,30 +42,54 @@ const (
 )
 
 type freeGuard struct {
-	endpoint string // tests only; empty selects the account API base
-	now      func() time.Time
-	mu       sync.Mutex
-	accounts map[string]*ledger
+	// client is the plugin's own analytics client (see read), shared with the
+	// quota card.
+	client    httpDoer
+	hostProxy atomic.Pointer[string] // host proxy-url; nil until first seen
+	now       func() time.Time
+	mu        sync.Mutex
+	accounts  map[string]*ledger
 }
 
-// One ledger per account: tokens on one account share one allocation.
+// One ledger per account: tokens on one account share one allocation, and the
+// most conservative settings any of them carried apply to all of them.
 type ledger struct {
 	day      time.Time // UTC day of used
 	used     float64
 	readAt   time.Time // start of the read that produced used
 	pending  chan struct{}
 	admitted []charge
+	capacity float64 // lowest daily_free_neurons seen for the account
+	margin   float64 // highest safety_margin_neurons seen for the account
 }
 type charge struct {
 	at      time.Time
 	neurons float64
 }
 
-func newFreeGuard() *freeGuard {
-	return &freeGuard{now: time.Now, accounts: make(map[string]*ledger)}
+func newFreeGuard(client httpDoer) *freeGuard {
+	return &freeGuard{client: client, now: time.Now, accounts: make(map[string]*ledger)}
+}
+
+// observeHost records the host's global proxy-url, which executor requests do
+// not carry. Auth parse/refresh and model requests deliver it before an auth
+// can serve inference.
+func (g *freeGuard) observeHost(h pluginapi.HostConfigSummary) {
+	if g != nil {
+		proxy := strings.TrimSpace(h.ProxyURL)
+		g.hostProxy.Store(&proxy)
+	}
 }
 func freeAllowanceError(now time.Time) *pluginabi.Error {
 	return &pluginabi.Error{Code: "quota_exhausted", Message: "request could exceed the Workers AI daily free neuron allocation; refused to avoid paid usage", HTTPStatus: http.StatusTooManyRequests, RetryAfterSeconds: int(math.Ceil(nextReset(now).Sub(now).Seconds()))}
+}
+
+// tallyLimitError refuses a request that fits the measured usage but not the
+// recent admissions still being charged. It clears as those entries expire, so
+// it must not cool the auth/model down until midnight.
+func tallyLimitError(retry time.Duration) *pluginabi.Error {
+	seconds := int(math.Min(math.Max(math.Ceil(retry.Seconds()), 1), tallyWindow.Seconds()))
+	return &pluginabi.Error{Code: "rate_limit", Message: "recent requests may still reach the Workers AI daily free neuron allocation; retry after they are counted", HTTPStatus: http.StatusTooManyRequests, Retryable: true, RetryAfterSeconds: seconds}
 }
 func requestTooLargeError() *pluginabi.Error {
 	return &pluginabi.Error{Code: "request_too_large", Message: "request estimate exceeds the Workers AI daily free neuron allocation; lower max_tokens or the prompt", HTTPStatus: http.StatusBadRequest}
@@ -71,27 +100,29 @@ func usageUnverifiedError() *pluginabi.Error {
 
 // admit charges estimate to the credential's account or refuses. It never
 // fails open: a missing, failed, stale or cross-day reading refuses.
-func (g *freeGuard) admit(ctx context.Context, client pluginapi.HostHTTPClient, c credentials, estimate float64) error {
+func (g *freeGuard) admit(ctx context.Context, c credentials, estimate float64) error {
 	if !c.stayWithinFree {
 		return nil
 	}
-	if g == nil || client == nil || !(estimate >= 0) || math.IsInf(estimate, 0) {
+	if g == nil || g.client == nil || !(estimate >= 0) || math.IsInf(estimate, 0) {
 		return usageUnverifiedError()
-	}
-	// A request that cannot fit even at zero usage is the request's fault; a
-	// 429 would cool the auth/model down for every smaller request until reset.
-	if estimate+c.safetyMargin >= c.capacity {
-		return requestTooLargeError()
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	l := g.accounts[c.account]
 	if l == nil {
-		l = &ledger{}
+		l = &ledger{capacity: c.capacity, margin: c.safetyMargin}
 		g.accounts[c.account] = l
 	}
+	// Several auths on one account: the most permissive must not decide.
+	l.capacity, l.margin = math.Min(l.capacity, c.capacity), math.Max(l.margin, c.safetyMargin)
+	// A request that cannot fit even at zero usage is the request's fault; a
+	// 429 would cool the auth/model down for every smaller request until reset.
+	if estimate+l.margin >= l.capacity {
+		return requestTooLargeError()
+	}
 	if now := g.now(); l.usable(now, readingTTL) {
-		return l.charge(c, estimate, now)
+		return l.charge(estimate, now)
 	}
 	if wait := l.pending; wait != nil {
 		// Single flight per account: share the read already in progress.
@@ -108,7 +139,7 @@ func (g *freeGuard) admit(ctx context.Context, client pluginapi.HostHTTPClient, 
 		l.pending = done
 		g.mu.Unlock()
 		start := g.now()
-		used, err := g.read(ctx, client, c, start)
+		used, err := g.read(ctx, c, start)
 		g.mu.Lock()
 		// A read crossing UTC midnight belongs to neither day.
 		if err == nil && utcDay(g.now()).Equal(utcDay(start)) && !start.Before(l.readAt) {
@@ -123,62 +154,63 @@ func (g *freeGuard) admit(ctx context.Context, client pluginapi.HostHTTPClient, 
 	// After a failed read a same-day reading up to readingMaxAge old still
 	// bounds usage; anything older fails closed.
 	if now := g.now(); l.usable(now, readingMaxAge) {
-		return l.charge(c, estimate, now)
+		return l.charge(estimate, now)
 	}
 	return usageUnverifiedError()
 }
 
 // read runs without the lock. Waiters share it, so one caller's cancellation
 // must not fail theirs; fetchAnalytics bounds it to 15 seconds.
-func (g *freeGuard) read(ctx context.Context, client pluginapi.HostHTTPClient, c credentials, now time.Time) (used float64, err error) {
+//
+// It uses the plugin's own client, not the executor's host HTTP client. The
+// host client is bound to the inference request's context, so it would write
+// this GraphQL request, analytics bearer token included, into that request's
+// API log and mark it as an upstream attempt; the plugin cannot strip either
+// from that context. The read still follows the proxy policy the host applies
+// to inference: the auth's proxy_url, else the host's global proxy-url. Until
+// the host's setting has been seen the read is refused rather than sent
+// direct, and an invalid proxy fails the read; both fail closed.
+func (g *freeGuard) read(ctx context.Context, c credentials, now time.Time) (used float64, err error) {
 	defer func() {
 		if recover() != nil {
 			used, err = 0, usageUnverifiedError()
 		}
 	}()
-	endpoint := g.endpoint
-	if endpoint == "" {
-		endpoint = selectedBase(upstreamBase) + "/client/v4/graphql"
+	proxy := c.proxyURL
+	if proxy == "" {
+		host := g.hostProxy.Load()
+		if host == nil {
+			return 0, usageUnverifiedError()
+		}
+		proxy = *host
 	}
-	return fetchAnalytics(context.WithoutCancel(ctx), hostDoer{client}, endpoint, c, now)
+	endpoint := selectedBase(upstreamBase) + "/client/v4/graphql"
+	return fetchAnalytics(kit.WithProxyURL(context.WithoutCancel(ctx), proxy), g.client, endpoint, c, now)
 }
 func (l *ledger) usable(now time.Time, maxAge time.Duration) bool {
 	return !l.readAt.IsZero() && l.day.Equal(utcDay(now)) && !l.readAt.After(now) && now.Sub(l.readAt) < maxAge
 }
-func (l *ledger) charge(c credentials, estimate float64, now time.Time) error {
-	kept, tally := l.admitted[:0], 0.0
+func (l *ledger) charge(estimate float64, now time.Time) error {
+	// Measured usage alone leaves no room: wait for the UTC reset.
+	if l.used+estimate+l.margin >= l.capacity {
+		return freeAllowanceError(now)
+	}
+	kept, tally, expires := l.admitted[:0], 0.0, now.Add(tallyWindow)
 	for _, a := range l.admitted {
 		// Entries from before midnight keep counting: conservative.
 		if now.Sub(a.at) < tallyWindow {
 			kept, tally = append(kept, a), tally+a.neurons
+			if end := a.at.Add(tallyWindow); end.Before(expires) {
+				expires = end
+			}
 		}
 	}
 	l.admitted = kept
-	if l.used+tally+estimate+c.safetyMargin >= c.capacity {
-		return freeAllowanceError(now)
+	if l.used+tally+estimate+l.margin >= l.capacity {
+		return tallyLimitError(expires.Sub(now))
 	}
 	l.admitted = append(l.admitted, charge{at: now, neurons: estimate})
 	return nil
-}
-
-// hostDoer sends the analytics read through the host HTTP client, so executor
-// reads follow the same auth/global proxy policy as inference. The host strips
-// credential headers on cross-origin redirects.
-type hostDoer struct{ client pluginapi.HostHTTPClient }
-
-func (h hostDoer) Do(req *http.Request) (*http.Response, error) {
-	var body []byte
-	if req.Body != nil {
-		var err error
-		if body, err = io.ReadAll(req.Body); err != nil {
-			return nil, err
-		}
-	}
-	resp, err := h.client.Do(req.Context(), pluginapi.HTTPRequest{Method: req.Method, URL: req.URL.String(), Headers: req.Header.Clone(), Body: body})
-	if err != nil {
-		return nil, err
-	}
-	return &http.Response{StatusCode: resp.StatusCode, Header: resp.Headers, Body: io.NopCloser(bytes.NewReader(resp.Body))}, nil
 }
 
 type neuronRate struct{ input, output float64 }
@@ -236,11 +268,12 @@ var worstNeuronRate = func() (worst neuronRate) {
 	return worst
 }()
 
-// estimateNeurons bounds one upstream chat body. Every token spans at least
-// one byte, so the body length bounds prompt tokens (JSON framing and images
-// only overcount), and output is bounded by max_tokens/max_completion_tokens,
-// whichever is larger. buildRequest always sets max_tokens in free-only mode;
-// an unbounded body returns +Inf, which admit refuses.
+// estimateNeurons bounds one upstream chat body. With only text content (see
+// freeOnlyBodyError) every prompt token spans at least one body byte, so the
+// body length bounds prompt tokens (JSON framing only overcounts), and output
+// is bounded by max_tokens/max_completion_tokens, whichever is larger.
+// buildRequest always sets an integer max_tokens in free-only mode; a missing,
+// fractional or otherwise invalid bound returns +Inf, which admit refuses.
 func estimateNeurons(body []byte) float64 {
 	var wire struct {
 		Model               string          `json:"model"`
@@ -250,8 +283,10 @@ func estimateNeurons(body []byte) float64 {
 	if json.Unmarshal(body, &wire) != nil {
 		return math.Inf(1)
 	}
-	output := math.Max(positiveNumber(wire.MaxTokens), positiveNumber(wire.MaxCompletionTokens))
-	if output == 0 {
+	maxTokens, okTokens := tokenLimit(wire.MaxTokens)
+	maxCompletion, okCompletion := tokenLimit(wire.MaxCompletionTokens)
+	output := math.Max(maxTokens, maxCompletion)
+	if !okTokens || !okCompletion || output == 0 {
 		return math.Inf(1)
 	}
 	rate, ok := neuronRates[wire.Model]
@@ -260,10 +295,68 @@ func estimateNeurons(body []byte) float64 {
 	}
 	return math.Ceil((float64(len(body))*rate.input + output*rate.output) / 1e6)
 }
-func positiveNumber(raw json.RawMessage) float64 {
-	var n float64
-	if len(raw) == 0 || json.Unmarshal(raw, &n) != nil || !(n > 0) || math.IsInf(n, 0) {
-		return 0
+
+// tokenLimit reads an output-token bound: absent or null is (0, true), an
+// integer from 1 to 2^53 is (n, true), anything else is invalid.
+func tokenLimit(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, true
 	}
-	return n
+	var n float64
+	if json.Unmarshal(raw, &n) != nil || !(n >= 1) || n > 1<<53 || n != math.Trunc(n) {
+		return 0, false
+	}
+	return n, true
+}
+
+// freeOnlyBodyError rejects request shapes the estimate cannot bound. Image,
+// audio and file parts can expand to far more tokens than their bytes; n and
+// best_of multiply the output; and a non-integer token limit is not what the
+// estimate charges. Each is a client error (400), never forwarded.
+func freeOnlyBodyError(body map[string]json.RawMessage) error {
+	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		if _, ok := tokenLimit(body[field]); !ok {
+			return &pluginabi.Error{Code: "invalid_request", Message: field + " must be an integer of at least 1 while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
+		}
+	}
+	for _, field := range []string{"n", "best_of"} {
+		if raw := body[field]; len(raw) != 0 && string(raw) != "null" && string(raw) != "1" {
+			return &pluginabi.Error{Code: "invalid_request", Message: field + " above 1 is not supported while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
+		}
+	}
+	for _, field := range []string{"image", "audio"} {
+		// Native Workers AI media inputs; not bounded by body bytes either.
+		if raw := body[field]; len(raw) != 0 && string(raw) != "null" {
+			return &pluginabi.Error{Code: "invalid_request", Message: field + " input is not supported while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
+		}
+	}
+	textOnly := &pluginabi.Error{Code: "invalid_request", Message: "only text message content is supported while stay_within_free is on; image, audio and file parts cannot be bounded to the free allocation", HTTPStatus: http.StatusBadRequest}
+	raw := body["messages"]
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var messages []struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &messages) != nil {
+		return textOnly
+	}
+	for _, m := range messages {
+		content := bytes.TrimSpace(m.Content)
+		if len(content) == 0 || content[0] == '"' || string(content) == "null" {
+			continue
+		}
+		var parts []struct {
+			Type *string `json:"type"`
+		}
+		if json.Unmarshal(content, &parts) != nil {
+			return textOnly
+		}
+		for _, part := range parts {
+			if part.Type == nil || *part.Type != "text" {
+				return textOnly
+			}
+		}
+	}
+	return nil
 }

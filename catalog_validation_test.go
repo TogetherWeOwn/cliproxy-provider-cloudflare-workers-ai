@@ -68,7 +68,7 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 		}
 	})))
 	defer server.Close()
-	c := newCatalog(newFreeGuard())
+	c := newCatalog(testGuard(server))
 	req := pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
 	want := "cloudflare/@cf/ok/alive,cloudflare/@cf/busy/rate-limited,cloudflare/@cf/flaky/server-error,cloudflare/@cf/meta/llama-guard-3-8b"
 	start := time.Now()
@@ -105,7 +105,7 @@ func TestModelsForAuthHonoursCancellationDuringValidation(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, err := newCatalog(newFreeGuard()).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}); err == nil {
+	if _, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}); err == nil {
 		t.Fatal("cancelled discovery returned a catalog")
 	}
 }
@@ -164,7 +164,7 @@ func TestConcurrentDiscoveriesShareTheProbeLimit(t *testing.T) {
 		io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
 	})))
 	defer server.Close()
-	c := newCatalog(newFreeGuard())
+	c := newCatalog(testGuard(server))
 	var wg sync.WaitGroup
 	for _, key := range []string{"key-one", "key-two"} {
 		wg.Add(1)

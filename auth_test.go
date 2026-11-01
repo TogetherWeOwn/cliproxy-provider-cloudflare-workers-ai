@@ -17,7 +17,7 @@ func authJSON(account, key string) []byte {
 	return raw
 }
 func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
-	p := newAuthProvider()
+	p := newAuthProvider(nil)
 	parse := func(file, account, key string) (pluginapi.AuthParseResponse, error) {
 		return p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{FileName: file, RawJSON: authJSON(account, key)})
 	}
@@ -58,7 +58,7 @@ func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
 	}
 }
 func TestAuthValidationAndMetadataPrecedence(t *testing.T) {
-	p := newAuthProvider()
+	p := newAuthProvider(nil)
 	for _, raw := range []string{
 		`{}`, `{"type":"cloudflare-workers-ai","api_key":"example-key"}`, `{"type":"cloudflare-workers-ai","account_id":"../escape","api_key":"example-key"}`,
 		string(authJSON(testAccount, "")),

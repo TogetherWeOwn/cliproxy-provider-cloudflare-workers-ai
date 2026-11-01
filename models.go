@@ -37,10 +37,12 @@ func fallbackModels() []pluginapi.ModelInfo {
 func (catalog) RegisterModels(context.Context, pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
 	return pluginapi.ModelRegistrationResponse{Provider: provider, Models: fallbackModels()}, nil
 }
-func (catalog) StaticModels(context.Context, pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+func (cat catalog) StaticModels(_ context.Context, r pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+	cat.guard.observeHost(r.Host)
 	return pluginapi.ModelResponse{Provider: provider, Models: fallbackModels()}, nil
 }
 func (cat catalog) ModelsForAuth(ctx context.Context, r pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
+	cat.guard.observeHost(r.Host)
 	c, err := credentialsFrom(r.StorageJSON, r.Metadata)
 	if err != nil {
 		return pluginapi.ModelResponse{}, err

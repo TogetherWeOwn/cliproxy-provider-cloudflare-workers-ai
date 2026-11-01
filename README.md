@@ -54,7 +54,8 @@ mode `0600`. Never save actual credentials in this repository.
 - `daily_free_neurons`: optional positive finite number; default **10,000**, from
   the official pricing page. This sets the card's capacity and the hard stop's
   ceiling. It does not change the upstream allowance. Do not increase it to
-  invent free usage.
+  invent free usage. When several auths share one account, the hard stop uses
+  the **lowest** value any of them has carried since the plugin loaded.
 - `stay_within_free`: optional boolean; default **true**. Turns on the free-only
   hard stop. Set it to `false` only for an account where paid usage is
   approved; the plugin then behaves like v0.1.1 (no usage check before
@@ -62,7 +63,10 @@ mode `0600`. Never save actual credentials in this repository.
 - `safety_margin_neurons`: optional positive finite number; default **500**.
   This many neurons are kept unused below `daily_free_neurons`. The margin
   absorbs estimate errors, sampled analytics and other consumers. A margin at or
-  above the capacity refuses every request.
+  above the capacity refuses every request. When several auths share one
+  account, the hard stop uses the **highest** margin any of them has carried
+  since the plugin loaded. Raising the capacity or lowering the margin of a
+  shared account takes effect after a plugin reload.
 - Native `prefix`, `proxy_url`, weights, priorities, label and disabled fields
   remain host-owned. An optional auth prefix does not replace the fixed namespace.
 
@@ -127,9 +131,12 @@ Authorization: Bearer <workers-ai-api-token>
 
 The final host-translated OpenAI payload is preserved, with three exceptions:
 the model prefix is removed, the stream flag is set to match the execution
-method, and, with `stay_within_free` on, `max_tokens` is added if the payload
-has no positive value. The added value is `max_completion_tokens` when that is
-positive, else 4,096. The hard stop needs this cap to bound output. Streams
+method, and, with `stay_within_free` on, the output limit is normalised:
+`max_tokens` is set to the lower of `max_tokens` and `max_completion_tokens`
+when given, else 4,096, and a given `max_completion_tokens` is set to the same
+value. The hard stop charges exactly this cap. With `stay_within_free` on, some
+requests are refused before dispatch (see
+[Free-only hard stop](#free-only-hard-stop)). Streams
 are relayed incrementally. All inference/discovery requests use the injected
 **host HTTP client**. Arbitrary raw-HTTP destinations, methods and caller
 credentials are not forwarded. Token counting is local and explicitly estimated.
@@ -209,8 +216,18 @@ reading + tally + estimate + safety_margin_neurons < daily_free_neurons
 ```
 
 - **reading**: today's (UTC) account-wide `totalNeurons`. It uses the GraphQL
-  query above, sent through the **host HTTP client**, so it follows the same
-  proxy policy as inference. Each account has one reading, shared by all its
+  query above, sent with the plugin's own bounded analytics client (the one
+  the quota card uses), **not** the host HTTP client of the inference request:
+  that client would record the GraphQL request, analytics bearer token
+  included, in the inference request's API log and count it as an upstream
+  attempt. The read follows the same proxy policy as inference: the auth's
+  `proxy_url`, else the host's global `proxy-url`. The plugin learns the
+  global setting from the host's auth and model requests; until it has seen
+  it, an auth without its own `proxy_url` is refused (`quota_unverified`)
+  rather than read direct. An invalid proxy also fails the read. A per-call
+  proxy override that another plugin passes to a host model execution is not
+  visible to the plugin and does not apply to the read. Each account has one
+  reading, shared by all its
   tokens. The reading is cached for at most **60 s**, and only one read per
   account runs at a time. If a refresh fails, a same-day reading up to
   **2 minutes** old is still used. A reading from before 00:00 UTC is never
@@ -223,25 +240,41 @@ reading + tally + estimate + safety_margin_neurons < daily_free_neurons
   The rates are the model's neurons per million tokens from the official
   [pricing table](https://developers.cloudflare.com/workers-ai/platform/pricing/)
   (retrieved 2026-11-01). A model not in the table gets the highest input and
-  highest output rate in the table (127,273 / 606,061). Every token is at least
-  one byte, so the upstream body's byte length bounds the prompt tokens; JSON
-  framing and images only overcount. `max_output` is the larger of
-  `max_tokens` and `max_completion_tokens` (see the output cap above). Cached
-  input is charged at the uncached rate.
+  highest output rate in the table (127,273 / 606,061). With text-only content
+  every token is at least one byte, so the upstream body's byte length bounds
+  the prompt tokens; JSON framing only overcounts. `max_output` is the
+  normalised output cap (see the output cap above). Cached input is charged at
+  the uncached rate.
+
+Requests the estimate cannot bound are refused before any analytics read or
+dispatch, with `invalid_request` (HTTP 400, not retryable, no cooldown):
+
+- a message content part whose `type` is not `"text"` (`image_url`, remote or
+  data-URI; `input_audio`; `file`; a part without a type), content that is
+  neither a string, `null` nor an array of parts, or a top-level `image` or
+  `audio` input. Images and audio can expand to far more tokens than bytes;
+- `max_tokens` or `max_completion_tokens` that is present but not an integer of
+  at least 1 (for example `0.0001`, `1.5`, `0` or `"many"`); `null` counts as
+  absent;
+- `n` or `best_of` other than 1 (each extra completion multiplies output).
 
 Refusals never reach Cloudflare:
 
 | Condition | Plugin error | Retry hint |
 | --- | --- | --- |
 | `estimate + safety_margin_neurons >= daily_free_neurons` (cannot fit even at zero usage) | `request_too_large`, HTTP 400 | None; lower `max_tokens` or the prompt |
-| Check above fails (would reach the allowance) | `quota_exhausted`, HTTP 429, non-retryable | Until next 00:00 UTC |
-| No reading, failed read, reading older than 2 minutes, or read across midnight | `quota_unverified`, HTTP 503 | 60 seconds |
+| Unbounded request shape (list above) | `invalid_request`, HTTP 400 | None; send text only, an integer limit and one completion |
+| `reading + estimate + safety_margin_neurons >= daily_free_neurons` (the reading alone leaves no room) | `quota_exhausted`, HTTP 429, non-retryable | Until next 00:00 UTC |
+| Only the tally pushes the check over | `rate_limit`, HTTP 429, retryable | Until the oldest tally entry leaves the 10-minute window (at most 10 minutes) |
+| No reading, failed read, reading older than 2 minutes, unknown host proxy, or read across midnight | `quota_unverified`, HTTP 503 | 60 seconds |
 
 The `quota_exhausted` refusal keeps that auth/model in native cooldown until the
-UTC reset, even when it was caused only by a large estimate or a busy tally.
-This is deliberate. The plugin never opens the gate just because analytics
-might be stale. Set `stay_within_free: false` only where paid usage has been
-approved.
+UTC reset; it is returned only when today's measured usage leaves no room for
+the request. A refusal caused only by recent admissions still in the tally is a
+`rate_limit` whose retry hint is at most 10 minutes, so the host cools the
+auth/model down for minutes, not for the rest of the day. The plugin never
+opens the gate just because analytics might be stale. Set
+`stay_within_free: false` only where paid usage has been approved.
 
 **Overshoot bound.** Two assumptions:
 
@@ -279,8 +312,9 @@ or raise the margin to cover the others.
 | 429 / 3040 or other rate/capacity 429 | `rate_limit` | 5 seconds, or valid upstream `Retry-After` |
 | 408 / 5xx | `upstream_error` | Retryable, honoring `Retry-After` |
 
-The free-only hard stop's own refusals (`quota_exhausted` before dispatch,
-`quota_unverified`) are listed in [Free-only hard stop](#free-only-hard-stop).
+The free-only hard stop's own refusals (`invalid_request`, `request_too_large`,
+`quota_exhausted` and `rate_limit` before dispatch, `quota_unverified`) are
+listed in [Free-only hard stop](#free-only-hard-stop).
 
 Daily hints can be extended by a longer upstream `Retry-After`. Bodies, account
 IDs, tokens and transport diagnostics never appear in public plugin errors.

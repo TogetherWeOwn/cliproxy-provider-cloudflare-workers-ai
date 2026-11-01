@@ -22,7 +22,7 @@ func newExecutor(guard *freeGuard) executor {
 		if err != nil {
 			return pluginapi.HTTPRequest{}, err
 		}
-		if err = guard.admit(ctx, r.HTTPClient, c, estimateNeurons(req.Body)); err != nil {
+		if err = guard.admit(ctx, c, estimateNeurons(req.Body)); err != nil {
 			return pluginapi.HTTPRequest{}, err
 		}
 		return req, nil
@@ -61,14 +61,26 @@ func upstreamRequest(r pluginapi.ExecutorRequest) (pluginapi.HTTPRequest, creden
 	}
 	body["model"], _ = json.Marshal(strings.TrimPrefix(model, modelPrefix))
 	body["stream"], _ = json.Marshal(r.Stream)
-	// The free-only estimate needs an output bound; without a positive
-	// max_tokens, cap output at max_completion_tokens or the default.
-	if c.stayWithinFree && positiveNumber(body["max_tokens"]) == 0 {
-		limit := positiveNumber(body["max_completion_tokens"])
+	// The free-only estimate needs an output bound it can trust. Both limits
+	// are sent as the one integer the estimate charges: the lower of those
+	// given, else the default.
+	if c.stayWithinFree {
+		if err := freeOnlyBodyError(body); err != nil {
+			return pluginapi.HTTPRequest{}, c, err
+		}
+		maxTokens, _ := tokenLimit(body["max_tokens"])
+		maxCompletion, _ := tokenLimit(body["max_completion_tokens"])
+		limit := maxTokens
+		if limit == 0 || maxCompletion != 0 && maxCompletion < limit {
+			limit = maxCompletion
+		}
 		if limit == 0 {
 			limit = defaultMaxOutputTokens
 		}
-		body["max_tokens"], _ = json.Marshal(limit)
+		body["max_tokens"], _ = json.Marshal(int64(limit))
+		if maxCompletion != 0 {
+			body["max_completion_tokens"] = body["max_tokens"]
+		}
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

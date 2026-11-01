@@ -55,7 +55,7 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 			defer func() { <-sem }()
 			// A probe the free-only guard refuses is inconclusive: no request
 			// is sent and the model stays advertised.
-			if c.guard.admit(budget, client, cred, estimateNeurons(probeBody(id))) != nil {
+			if c.guard.admit(budget, cred, estimateNeurons(probeBody(id))) != nil {
 				return
 			}
 			if usable, definitive := probeModel(budget, client, cred, id); definitive {
