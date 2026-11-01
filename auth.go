@@ -150,10 +150,17 @@ func newAuthProvider(guard *freeGuard) (*authProvider, error) {
 	// answer as a JSON string, while credentialsFields (numberField, the
 	// stay_within_free bool) requires numbers/booleans for the tunables, so
 	// those stay file-managed. Parse is the full ParseAuth pipeline.
+	// Identity here is account+token (see the duplicate guard in ParseAuth),
+	// so account_id must join the key in the kit's deterministic login file
+	// name: key-only derivation made the same token under two accounts mint
+	// one file name and the second login overwrote the first account's
+	// ownership entry. credentialsFields canonicalizes the account to
+	// lowercase, so the filename fold matches it: mixed-case spellings of
+	// one account then mint one file name instead of tripping the guard.
 	login, err := kit.NewAPIKeyLogin(kit.APIKeyLoginConfig{Provider: provider, Parse: p.ParseAuth, Fields: []kit.APIKeyLoginField{
-		{Name: "account_id", Label: "Account ID", Description: "Cloudflare account ID: 32 lowercase hex characters.", Required: true},
+		{Name: "account_id", Label: "Account ID", Description: "Cloudflare account ID: 32 lowercase hex characters.", Required: true, LowercaseForFilename: true},
 		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false},
-	}})
+	}, FilenameFields: []string{"account_id"}})
 	if err != nil {
 		return nil, err
 	}
