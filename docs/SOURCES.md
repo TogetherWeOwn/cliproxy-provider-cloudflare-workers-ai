@@ -81,9 +81,9 @@ as transient, because the documented rate limits and code 3040 are not daily
 exhaustion. `Retry-After` parsing (delta-seconds or HTTP-date) follows
 [RFC 9110 section 10.2.3](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3).
 
-## Host contract (CLIProxyAPI v8.0.48)
+## Host contract (CLIProxyAPI v8.0.49)
 
-- `sdk/pluginabi/types.go`: ABI 1 / RPC schema 9 envelopes, `retry_after_seconds`.
+- `sdk/pluginabi/types.go`: ABI 1 / RPC schema 10 envelopes, `retry_after_seconds`.
 - `internal/pluginhost/rpc_client.go`: RPC-to-host error adaptation (drops the
   transient marker; characterized in `integration/hostcompat/compat_test.go`).
 - `sdk/cliproxy/auth/conductor_cooldown.go`: native per-auth/model cooldown.

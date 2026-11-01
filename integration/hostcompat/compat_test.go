@@ -96,7 +96,7 @@ func fixtureOf(body map[string]any) (fx fixture) {
 	return fx
 }
 
-// Real v8.0.48 dlopen, C-ABI registration, RPC dispatch, auth persistence and
+// Real v8.0.49 dlopen, C-ABI registration, RPC dispatch, auth persistence and
 // executor adapters. The only provider network target is an httptest server.
 func TestRealHostLoader(t *testing.T) {
 	var polls atomic.Int32
@@ -222,7 +222,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.4" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.1.5" {
 		t.Fatalf("metadata %+v", info)
 	}
 	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
@@ -449,7 +449,7 @@ func TestRealHostLoader(t *testing.T) {
 		if state == nil || !state.Quota.Exceeded {
 			t.Fatalf("host changed; revisit documented RPC limitation %+v", state)
 		}
-		t.Log("v8.0.48 RPC drops the transient marker; rate/capacity 429 is marked model quota-exceeded")
+		t.Log("v8.0.49 RPC drops the transient marker; rate/capacity 429 is marked model quota-exceeded")
 	})
 }
 func TestRegistryUsesNativeStoreSchema(t *testing.T) {
@@ -458,7 +458,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.4" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.1.5" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }
