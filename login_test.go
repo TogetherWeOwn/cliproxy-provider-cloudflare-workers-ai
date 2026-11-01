@@ -189,7 +189,8 @@ func TestAPIKeyLoginSameTokenTwoAccounts(t *testing.T) {
 }
 
 // TestLoginAbandonedSubmitReleasesOwnership mirrors the kit regression for
-// TWO-908/kit#13: a key submitted through login but never polled must only be
+// cliproxy-provider-kit#13: a key submitted through login but never polled
+// must only be
 // reserved until the login session expires. Afterwards the same account and
 // token parse under a different filename instead of failing duplicate_auth
 // until a plugin restart.
