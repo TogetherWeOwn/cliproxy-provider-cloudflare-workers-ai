@@ -6,7 +6,9 @@ import (
 	"html"
 	"strings"
 	"testing"
+	"time"
 
+	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -18,9 +20,14 @@ const (
 
 func startTestLogin(t *testing.T) (*authProvider, pluginapi.AuthLoginStartResponse) {
 	t.Helper()
+	return startTestLoginTTL(t, 0)
+}
+
+func startTestLoginTTL(t *testing.T, ttl time.Duration) (*authProvider, pluginapi.AuthLoginStartResponse) {
+	t.Helper()
 	ctx := context.Background()
 	// A nil guard is safe: observeHost and observeAuth ignore a nil receiver.
-	p, err := newAuthProvider(nil)
+	p, err := newAuthProviderWithLoginTTL(nil, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +83,11 @@ func TestAPIKeyLoginWired(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("page missing prompt %q", want)
 		}
+	}
+	// The analytics key is a Secret login field: the page reads it with hidden
+	// input, like the API key, while the account ID stays visible.
+	if !strings.Contains(body, "read -rs PLUGIN_FIELD_ANALYTICS_API_KEY") || !strings.Contains(body, "read -r PLUGIN_FIELD_ACCOUNT_ID") {
+		t.Fatalf("analytics key not read as a secret: %s", body)
 	}
 	submit, err := p.Login.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "POST",
 		Path: testSubmitPath,
@@ -136,6 +148,7 @@ func loginOnce(t *testing.T, p *authProvider, account string) pluginapi.AuthData
 // two accounts must mint two file names and keep both ownership entries,
 // instead of the second login overwriting the first account's entry.
 func TestAPIKeyLoginSameTokenTwoAccounts(t *testing.T) {
+	ctx := context.Background()
 	p, _ := startTestLogin(t)
 	first := loginOnce(t, p, testAccount)
 	second := loginOnce(t, p, otherAccount)
@@ -145,24 +158,93 @@ func TestAPIKeyLoginSameTokenTwoAccounts(t *testing.T) {
 	if first.ID == second.ID {
 		t.Fatalf("accounts share an auth ID: %q", first.ID)
 	}
-	p.mu.Lock()
-	files, owners := len(p.files), len(p.owners)
-	p.mu.Unlock()
-	if files != 2 || owners != 2 {
-		t.Fatalf("ownership entries lost: files=%d owners=%d, want 2/2", files, owners)
+	// Both ownership entries survive: a host parse of each saved login file
+	// commits under its own file name, and either identity under a third
+	// filename is a duplicate. (The kit guard's maps are its own, and login
+	// parses only reserve ownership, so this is asserted behaviorally.)
+	for _, tc := range []struct {
+		auth    pluginapi.AuthData
+		account string
+	}{{first, testAccount}, {second, otherAccount}} {
+		if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: tc.auth.FileName, RawJSON: authJSON(tc.account, "example-key")}); err != nil {
+			t.Fatalf("host parse of %s: %v", tc.auth.FileName, err)
+		}
+		if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: "third.json", RawJSON: authJSON(tc.account, "example-key")}); err == nil || kit.MapError(err).Code != "duplicate_auth" {
+			t.Fatalf("third filename for %s = %v, want duplicate_auth", tc.account, err)
+		}
 	}
 	// Re-login of the first identity stays idempotent, including under a
 	// mixed-case spelling of the account (credentialsFields canonicalizes
-	// to lowercase): same filename, no duplicate_auth, no extra entry.
+	// to lowercase): same filename, no duplicate_auth, ownership unchanged.
 	again := loginOnce(t, p, strings.ToUpper(testAccount))
 	if again.FileName != first.FileName || again.ID != first.ID {
 		t.Fatalf("re-login not idempotent: %+v vs %+v", again, first)
 	}
-	p.mu.Lock()
-	files, owners = len(p.files), len(p.owners)
-	p.mu.Unlock()
-	if files != 2 || owners != 2 {
-		t.Fatalf("re-login churned ownership: files=%d owners=%d, want 2/2", files, owners)
+	if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: first.FileName, RawJSON: authJSON(testAccount, "example-key")}); err != nil {
+		t.Fatalf("host reparse after re-login: %v", err)
+	}
+	if _, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: "third.json", RawJSON: authJSON(testAccount, "example-key")}); err == nil || kit.MapError(err).Code != "duplicate_auth" {
+		t.Fatalf("re-login churned ownership: %v", err)
+	}
+}
+
+// TestLoginAbandonedSubmitReleasesOwnership mirrors the kit regression for
+// cliproxy-provider-kit#13: a key submitted through login but never polled
+// must only be
+// reserved until the login session expires. Afterwards the same account and
+// token parse under a different filename instead of failing duplicate_auth
+// until a plugin restart.
+func TestLoginAbandonedSubmitReleasesOwnership(t *testing.T) {
+	ctx := context.Background()
+	p, start := startTestLoginTTL(t, 2*time.Second)
+	submit := func(state string) pluginapi.ManagementResponse {
+		resp, err := p.Login.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "POST",
+			Path: testSubmitPath,
+			Body: []byte(`{"state":"` + state + `","api_key":"example-key","account_id":"` + testAccount + `"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	upload := func() error {
+		_, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{FileName: "upload.json", RawJSON: authJSON(testAccount, "example-key")})
+		return err
+	}
+
+	// Submit a key, then abandon the login (never poll).
+	if resp := submit(start.State); resp.StatusCode != 200 {
+		t.Fatalf("submit %+v", resp)
+	}
+	// The in-flight login still blocks a different filename.
+	if err := upload(); err == nil || kit.MapError(err).Code != "duplicate_auth" {
+		t.Fatalf("upload during login = %v, want duplicate_auth", err)
+	}
+	// The kit guard's clock is not injectable from this package, so retry the
+	// upload until the abandoned session's reservation lapses instead of
+	// sleeping for one fixed span; the deadline only bounds a broken guard.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		err := upload()
+		if err == nil {
+			break
+		}
+		if kit.MapError(err).Code != "duplicate_auth" {
+			t.Fatalf("upload after abandoned session: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("abandoned login still holds ownership after expiry: %v", err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Submit-time duplicate feedback still works against the committed owner.
+	second, err := p.StartLogin(ctx, pluginapi.AuthLoginStartRequest{Provider: provider,
+		BaseURL: testBaseURL, Host: pluginapi.HostConfigSummary{AuthDir: "/tmp/cloudflare-auth"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := submit(second.State); resp.StatusCode != 400 || !strings.Contains(string(resp.Body), "duplicate_auth") {
+		t.Fatalf("duplicate submit %+v %s", resp, resp.Body)
 	}
 }
 
