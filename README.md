@@ -93,10 +93,12 @@ call.
 
 ## Management-UI login
 
-The management UI's login card serves a kit login page that prompts for the API
+The management UI's login card serves a kit login page that displays a shell
+block. Paste it into `bash` or `zsh`; the terminal then prompts for the API
 token, the Cloudflare account ID and the optional separate analytics token, then
-submits them over an authenticated management POST (secrets travel in the POST
-body only, never in URLs, logs or process arguments). The submission runs the
+submits them over an authenticated management POST (the API token travels in
+the POST body and the management key in the `Authorization` header, never in
+URLs, logs or process arguments). The submission runs the
 same ParseAuth validation and duplicate-auth guard as an uploaded auth file, so
 submitting the same account and token twice is idempotent. On a remote host, set
 `CLIPROXY_BASE` to an `https://` base so secrets are encrypted in transit.
@@ -404,7 +406,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.5_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.2.0_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.
