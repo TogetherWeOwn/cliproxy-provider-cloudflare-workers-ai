@@ -13,7 +13,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-type catalog struct{}
+type catalog struct {
+	cache *verdictCache
+	// probes is shared by every discovery so overlapping ModelsForAuth calls
+	// stay within probeConcurrency in total.
+	probes chan struct{}
+}
+
+func newCatalog() catalog {
+	return catalog{cache: newVerdictCache(), probes: make(chan struct{}, probeConcurrency)}
+}
 
 func modelInfo(id string) pluginapi.ModelInfo {
 	return pluginapi.ModelInfo{ID: modelPrefix + id, Object: "model", OwnedBy: provider, DisplayName: id}
@@ -29,7 +38,7 @@ func (catalog) RegisterModels(context.Context, pluginapi.ModelRegistrationReques
 func (catalog) StaticModels(context.Context, pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
 	return pluginapi.ModelResponse{Provider: provider, Models: fallbackModels()}, nil
 }
-func (catalog) ModelsForAuth(ctx context.Context, r pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
+func (cat catalog) ModelsForAuth(ctx context.Context, r pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
 	c, err := credentialsFrom(r.StorageJSON, r.Metadata)
 	if err != nil {
 		return pluginapi.ModelResponse{}, err
@@ -42,7 +51,11 @@ func (catalog) ModelsForAuth(ctx context.Context, r pluginapi.AuthModelRequest) 
 		if ctx.Err() != nil {
 			return pluginapi.ModelResponse{}, ctx.Err()
 		}
-		return pluginapi.ModelResponse{Provider: provider, Models: fallbackModels()}, nil
+		models = fallbackModels()
+	}
+	// Discovered and fallback IDs alike are validated against the account.
+	if models, err = cat.validate(ctx, r.HTTPClient, c, models); err != nil {
+		return pluginapi.ModelResponse{}, err
 	}
 	return pluginapi.ModelResponse{Provider: provider, Models: models}, nil
 }

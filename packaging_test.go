@@ -21,7 +21,7 @@ func TestReleaseArchiveAndChecksums(t *testing.T) {
 	if result, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("package: %v\n%s", err, result)
 	}
-	archive := filepath.Join(out, "cloudflare-workers-ai_0.1.0_linux_amd64.zip")
+	archive := filepath.Join(out, "cloudflare-workers-ai_0.1.1_linux_amd64.zip")
 	raw, err := os.ReadFile(archive)
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func TestReleaseArchiveAndChecksums(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(checksums), hex.EncodeToString(sum[:])+"  cloudflare-workers-ai_0.1.0_linux_amd64.zip") {
+	if !strings.Contains(string(checksums), hex.EncodeToString(sum[:])+"  cloudflare-workers-ai_0.1.1_linux_amd64.zip") {
 		t.Fatalf("incorrect checksums %s", checksums)
 	}
 	reader, err := zip.OpenReader(archive)
