@@ -3,7 +3,7 @@
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, a **daily neuron quota card** and a
 **free-only hard stop** that is on by default. Uses the
-[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `21069bf`
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `88850ce`
 and the real **CLIProxyAPI v8.0.49** C-ABI loader (ABI 1, RPC schema 10). Requires CLIProxyAPI
 **v8.0.49 or newer**: the kit refuses hosts older than RPC schema 10.
 
