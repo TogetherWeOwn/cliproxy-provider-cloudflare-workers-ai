@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"math"
 	"net/http"
 	"strings"
@@ -39,12 +37,16 @@ const (
 	readingMaxAge          = 2 * time.Minute
 	tallyWindow            = 10 * time.Minute
 	defaultMaxOutputTokens = 4096
+	templateOverheadTokens = 512
 )
 
 type freeGuard struct {
 	// client is the plugin's own analytics client (see read), shared with the
 	// quota card.
-	client    httpDoer
+	client httpDoer
+	// endpoint overrides the analytics GraphQL URL; tests point it at
+	// loopback so no test can reach the real API.
+	endpoint  string
 	hostProxy atomic.Pointer[string] // host proxy-url; nil until first seen
 	now       func() time.Time
 	mu        sync.Mutex
@@ -184,7 +186,10 @@ func (g *freeGuard) read(ctx context.Context, c credentials, now time.Time) (use
 		}
 		proxy = *host
 	}
-	endpoint := selectedBase(upstreamBase) + "/client/v4/graphql"
+	endpoint := g.endpoint
+	if endpoint == "" {
+		endpoint = selectedBase(upstreamBase) + "/client/v4/graphql"
+	}
 	return fetchAnalytics(kit.WithProxyURL(context.WithoutCancel(ctx), proxy), g.client, endpoint, c, now)
 }
 func (l *ledger) usable(now time.Time, maxAge time.Duration) bool {
@@ -217,8 +222,8 @@ type neuronRate struct{ input, output float64 }
 
 // Neurons per million tokens from the official LLM pricing table, retrieved
 // 2026-11-01: https://developers.cloudflare.com/workers-ai/platform/pricing/
-// Cached input is charged as uncached. A model missing here is charged the
-// highest input and output rate in the table.
+// Cached input is charged as uncached. While stay_within_free is on, a model
+// missing here is neither advertised nor served: it cannot be bounded.
 var neuronRates = map[string]neuronRate{
 	"@cf/meta/llama-3.2-1b-instruct":               {2457, 18252},
 	"@cf/meta/llama-3.2-3b-instruct":               {4625, 30475},
@@ -261,102 +266,12 @@ var neuronRates = map[string]neuronRate{
 	"@cf/daily-co/phonellm-mini-alpha-2":           {5455, 21818},
 	"@cf/moondream/moondream3.1-9B-A2B":            {27273, 90909},
 }
-var worstNeuronRate = func() (worst neuronRate) {
-	for _, r := range neuronRates {
-		worst.input, worst.output = math.Max(worst.input, r.input), math.Max(worst.output, r.output)
-	}
-	return worst
-}()
 
-// estimateNeurons bounds one upstream chat body. With only text content (see
-// freeOnlyBodyError) every prompt token spans at least one body byte, so the
-// body length bounds prompt tokens (JSON framing only overcounts), and output
-// is bounded by max_tokens/max_completion_tokens, whichever is larger.
-// buildRequest always sets an integer max_tokens in free-only mode; a missing,
-// fractional or otherwise invalid bound returns +Inf, which admit refuses.
-func estimateNeurons(body []byte) float64 {
-	var wire struct {
-		Model               string          `json:"model"`
-		MaxTokens           json.RawMessage `json:"max_tokens"`
-		MaxCompletionTokens json.RawMessage `json:"max_completion_tokens"`
-	}
-	if json.Unmarshal(body, &wire) != nil {
-		return math.Inf(1)
-	}
-	maxTokens, okTokens := tokenLimit(wire.MaxTokens)
-	maxCompletion, okCompletion := tokenLimit(wire.MaxCompletionTokens)
-	output := math.Max(maxTokens, maxCompletion)
-	if !okTokens || !okCompletion || output == 0 {
-		return math.Inf(1)
-	}
-	rate, ok := neuronRates[wire.Model]
-	if !ok {
-		rate = worstNeuronRate
-	}
-	return math.Ceil((float64(len(body))*rate.input + output*rate.output) / 1e6)
-}
-
-// tokenLimit reads an output-token bound: absent or null is (0, true), an
-// integer from 1 to 2^53 is (n, true), anything else is invalid.
-func tokenLimit(raw json.RawMessage) (float64, bool) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return 0, true
-	}
-	var n float64
-	if json.Unmarshal(raw, &n) != nil || !(n >= 1) || n > 1<<53 || n != math.Trunc(n) {
-		return 0, false
-	}
-	return n, true
-}
-
-// freeOnlyBodyError rejects request shapes the estimate cannot bound. Image,
-// audio and file parts can expand to far more tokens than their bytes; n and
-// best_of multiply the output; and a non-integer token limit is not what the
-// estimate charges. Each is a client error (400), never forwarded.
-func freeOnlyBodyError(body map[string]json.RawMessage) error {
-	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
-		if _, ok := tokenLimit(body[field]); !ok {
-			return &pluginabi.Error{Code: "invalid_request", Message: field + " must be an integer of at least 1 while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
-		}
-	}
-	for _, field := range []string{"n", "best_of"} {
-		if raw := body[field]; len(raw) != 0 && string(raw) != "null" && string(raw) != "1" {
-			return &pluginabi.Error{Code: "invalid_request", Message: field + " above 1 is not supported while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
-		}
-	}
-	for _, field := range []string{"image", "audio"} {
-		// Native Workers AI media inputs; not bounded by body bytes either.
-		if raw := body[field]; len(raw) != 0 && string(raw) != "null" {
-			return &pluginabi.Error{Code: "invalid_request", Message: field + " input is not supported while stay_within_free is on", HTTPStatus: http.StatusBadRequest}
-		}
-	}
-	textOnly := &pluginabi.Error{Code: "invalid_request", Message: "only text message content is supported while stay_within_free is on; image, audio and file parts cannot be bounded to the free allocation", HTTPStatus: http.StatusBadRequest}
-	raw := body["messages"]
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	var messages []struct {
-		Content json.RawMessage `json:"content"`
-	}
-	if json.Unmarshal(raw, &messages) != nil {
-		return textOnly
-	}
-	for _, m := range messages {
-		content := bytes.TrimSpace(m.Content)
-		if len(content) == 0 || content[0] == '"' || string(content) == "null" {
-			continue
-		}
-		var parts []struct {
-			Type *string `json:"type"`
-		}
-		if json.Unmarshal(content, &parts) != nil {
-			return textOnly
-		}
-		for _, part := range parts {
-			if part.Type == nil || *part.Type != "text" {
-				return textOnly
-			}
-		}
-	}
-	return nil
+// estimateNeurons bounds one rebuilt upstream body (see guardedBody). Its
+// content is text only, so every prompt token spans at least one body byte
+// and the body length bounds prompt tokens (JSON framing only overcounts);
+// templateOverheadTokens covers the model's chat template. Output is bounded
+// by limit, the max_tokens written into body.
+func estimateNeurons(rate neuronRate, body []byte, limit float64) float64 {
+	return math.Ceil((float64(len(body)+templateOverheadTokens)*rate.input + limit*rate.output) / 1e6)
 }

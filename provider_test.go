@@ -123,13 +123,15 @@ func TestChatExecutionStripsPrefixAndStreamsIncrementally(t *testing.T) {
 	cancel()
 }
 func TestRawHTTPIsPinnedAndInvalidModelsRejected(t *testing.T) {
-	out, _, err := upstreamRequest(httpExecutorRequest(pluginapi.ExecutorHTTPRequest{URL: "https://example.invalid/escape", Method: "DELETE", Headers: http.Header{"Authorization": {"Bearer attacker"}}, Body: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"}`), StorageJSON: authJSON(testAccount, "example-key")}))
+	out, _, _, err := upstreamRequest(httpExecutorRequest(pluginapi.ExecutorHTTPRequest{URL: "https://example.invalid/escape", Method: "DELETE", Headers: http.Header{"Authorization": {"Bearer attacker"}}, Body: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"}`), StorageJSON: authJSON(testAccount, "example-key")}), nil)
 	if err != nil || out.URL != "https://api.cloudflare.com/client/v4/accounts/"+testAccount+"/ai/v1/chat/completions" || out.Method != "POST" || out.Headers.Get("Authorization") != "Bearer example-key" {
 		t.Fatal("untrusted destination/headers forwarded", err)
 	}
 	for _, body := range []string{`null`, `[]`, `{}`, `{"model":"@cf/meta/llama-3.1-8b-instruct-fp8"}`, `{"model":"cloudflare/"}`, `{"model":"cloudflare/cloudflare/@cf/model"}`} {
-		if _, _, err := upstreamRequest(pluginapi.ExecutorRequest{Payload: []byte(body), StorageJSON: authJSON(testAccount, "example-key")}); err == nil {
-			t.Fatalf("accepted %s", body)
+		for _, metadata := range []map[string]any{nil, {"stay_within_free": false}} {
+			if _, _, _, err := upstreamRequest(pluginapi.ExecutorRequest{Payload: []byte(body), StorageJSON: authJSON(testAccount, "example-key"), AuthMetadata: metadata}, nil); err == nil {
+				t.Fatalf("accepted %s (metadata %v)", body, metadata)
+			}
 		}
 	}
 	count, err := newExecutor(newFreeGuard(nil)).CountTokens(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(`{"model":"example"}`)})

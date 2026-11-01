@@ -39,6 +39,11 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 	var wg sync.WaitGroup
 	for i, m := range candidates {
 		id := strings.TrimPrefix(m.ID, modelPrefix)
+		rate, priced := neuronRates[id]
+		if cred.stayWithinFree && !priced {
+			// The hard stop refuses models it cannot price: never advertised.
+			continue
+		}
 		if v, ok := c.cache.get(digest, id); ok {
 			alive[i] = v
 			continue
@@ -55,7 +60,7 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 			defer func() { <-sem }()
 			// A probe the free-only guard refuses is inconclusive: no request
 			// is sent and the model stays advertised.
-			if c.guard.admit(budget, cred, estimateNeurons(probeBody(id))) != nil {
+			if c.guard.admit(budget, cred, estimateNeurons(rate, probeBody(id), 1)) != nil {
 				return
 			}
 			if usable, definitive := probeModel(budget, client, cred, id); definitive {

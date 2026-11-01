@@ -6,6 +6,7 @@ package hostcompat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -59,6 +61,39 @@ func authJSON(key string) []byte {
 	return raw
 }
 
+// fixture reads mock directives from the first message. They travel in the
+// content because the free-only guard forwards only allowlisted fields.
+type fixture struct {
+	status                 int
+	daily, firstOnly, gate bool
+}
+
+func fixtureOf(body map[string]any) (fx fixture) {
+	messages, _ := body["messages"].([]any)
+	if len(messages) == 0 {
+		return fx
+	}
+	first, _ := messages[0].(map[string]any)
+	content, _ := first["content"].(string)
+	words := strings.Fields(content)
+	if len(words) == 0 || words[0] != "fixture" {
+		return fx
+	}
+	for _, word := range words[1:] {
+		switch {
+		case strings.HasPrefix(word, "status="):
+			fx.status, _ = strconv.Atoi(strings.TrimPrefix(word, "status="))
+		case word == "daily":
+			fx.daily = true
+		case word == "first_only":
+			fx.firstOnly = true
+		case word == "gate":
+			fx.gate = true
+		}
+	}
+	return fx
+}
+
 // Real v8.0.48 dlopen, C-ABI registration, RPC dispatch, auth persistence and
 // executor adapters. The only provider network target is an httptest server.
 func TestRealHostLoader(t *testing.T) {
@@ -103,14 +138,15 @@ func TestRealHostLoader(t *testing.T) {
 				w.WriteHeader(400)
 				return
 			}
-			if status, ok := body["fixture_status"].(float64); ok && !(body["fixture_first_only"] == true && token == "Bearer second-key") {
-				if status == 429 {
+			fx := fixtureOf(body)
+			if fx.status != 0 && !(fx.firstOnly && token == "Bearer second-key") {
+				if fx.status == 429 {
 					w.Header().Set("Retry-After", "7")
 				}
-				w.WriteHeader(int(status))
-				if body["fixture_daily"] == true {
+				w.WriteHeader(fx.status)
+				if fx.daily {
 					io.WriteString(w, `{"errors":[{"code":3036,"message":"daily neuron allocation exhausted"}]}`)
-				} else if status == 429 {
+				} else if fx.status == 429 {
 					io.WriteString(w, `{"errors":[{"code":3040,"message":"Capacity temporarily exceeded"}]}`)
 				} else {
 					io.WriteString(w, `{"error":"fixture failure"}`)
@@ -121,7 +157,7 @@ func TestRealHostLoader(t *testing.T) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				io.WriteString(w, "data: {\"id\":\"chat-example\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
 				w.(http.Flusher).Flush()
-				if body["fixture_gate"] == true {
+				if fx.gate {
 					select {
 					case <-gate:
 					case <-r.Context().Done():
@@ -244,7 +280,7 @@ func TestRealHostLoader(t *testing.T) {
 	if err != nil || !strings.Contains(string(resp.Payload), `"content":"hello"`) || !strings.Contains(string(resp.Payload), `"total_tokens":5`) {
 		t.Fatalf("execute %s %v", resp.Payload, err)
 	}
-	req.Payload = []byte(`{"model":"` + model + `","fixture_gate":true,"messages":[{"role":"user","content":"hello"}]}`)
+	req.Payload = []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"fixture gate"}]}`)
 	opts.Stream = true
 	stream, err := ex.ExecuteStream(ctx, auth, req, opts)
 	if err != nil {
@@ -272,7 +308,7 @@ func TestRealHostLoader(t *testing.T) {
 	}
 	opts.Stream = false
 	for _, status := range []int{401, 403, 404, 429, 503} {
-		raw, _ := json.Marshal(map[string]any{"model": model, "fixture_status": status})
+		raw, _ := json.Marshal(map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": fmt.Sprintf("fixture status=%d", status)}}})
 		req.Payload = raw
 		_, err = ex.Execute(ctx, auth, req, opts)
 		e, ok := err.(interface{ StatusCode() int })
@@ -310,7 +346,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		before := time.Now().UTC()
 		reset := time.Date(before.Year(), before.Month(), before.Day()+1, 0, 0, 0, 0, time.UTC)
-		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","fixture_status":429,"fixture_daily":true,"fixture_first_only":true}`)}
+		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"fixture status=429 daily first_only"}]}`)}
 		if _, err = mgr.Execute(ctx, []string{provider}, call, opts); err != nil {
 			t.Fatalf("sibling rotation %v", err)
 		}
@@ -402,7 +438,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		registry.GetGlobalRegistry().RegisterClient(one.ID, one.Provider, []*registry.ModelInfo{{ID: model}})
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(one.ID) })
-		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","fixture_status":429}`)}, opts)
+		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"fixture status=429"}]}`)}, opts)
 		if err == nil {
 			t.Fatal("rate failure disappeared")
 		}

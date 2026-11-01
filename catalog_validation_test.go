@@ -14,6 +14,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
+// These catalogs list models without a published price, which the free-only
+// guard never advertises (see TestUnpricedModelsAreNotAdvertisedWhileGuarded),
+// so they exercise probing with the guard off.
+var probeOnly = map[string]any{"stay_within_free": false}
+
 // Live evidence (2026-10-31): models/search lists models the account cannot use.
 // Only definitive rejections are dropped; inconclusive probes keep the model,
 // catalog order is preserved and definitive verdicts are cached per account.
@@ -69,7 +74,7 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 	})))
 	defer server.Close()
 	c := newCatalog(testGuard(server))
-	req := pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
+	req := pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), Metadata: probeOnly, HTTPClient: mockHostClient{server}}
 	want := "cloudflare/@cf/ok/alive,cloudflare/@cf/busy/rate-limited,cloudflare/@cf/flaky/server-error,cloudflare/@cf/meta/llama-guard-3-8b"
 	start := time.Now()
 	for round := 0; round < 2; round++ {
@@ -105,7 +110,7 @@ func TestModelsForAuthHonoursCancellationDuringValidation(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}); err == nil {
+	if _, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), Metadata: probeOnly, HTTPClient: mockHostClient{server}}); err == nil {
 		t.Fatal("cancelled discovery returned a catalog")
 	}
 }
@@ -170,7 +175,7 @@ func TestConcurrentDiscoveriesShareTheProbeLimit(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out, err := c.ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, key), HTTPClient: mockHostClient{server}})
+			out, err := c.ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, key), Metadata: probeOnly, HTTPClient: mockHostClient{server}})
 			if err != nil || len(out.Models) != len(names) {
 				t.Errorf("discovery %d %v", len(out.Models), err)
 			}

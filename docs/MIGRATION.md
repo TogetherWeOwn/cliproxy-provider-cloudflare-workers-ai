@@ -28,11 +28,18 @@ auth-directory watcher.
    refuses requests that could exceed the free allocation, and refuses when
    usage cannot be verified. Read its overshoot bound in the README. Keep it on
    unless paid usage is approved.
-5. With the hard stop on, check today's callers against the requests it now
-   refuses with HTTP 400 `invalid_request`: image, audio or file content parts
-   (only text content is accepted), a `max_tokens`/`max_completion_tokens`
-   that is not an integer of at least 1, and `n`/`best_of` above 1. Move such
-   callers to an auth with `stay_within_free: false` only where paid usage is
+5. With the hard stop on, only the allowlisted text-only request shape is
+   accepted, and the upstream body is rebuilt from it (README, "Accepted
+   request shape with the hard stop on"). Check today's callers against what
+   it refuses with HTTP 400 `invalid_request`: any top-level key outside the
+   allowlist (for example `prompt`, `image`, `audio`, `logprobs`), any key in
+   another case or given twice, message keys other than `role`, `content`,
+   `name`, `tool_calls`, `tool_call_id`, content parts other than exactly
+   `{"type":"text","text":...}` (image, audio and file parts), a
+   `max_tokens`/`max_completion_tokens` that is not an integer of at least 1,
+   and `n`/`best_of` other than 1. Models without a published neuron price are
+   refused with HTTP 400 `invalid_model` and not advertised. Move such callers
+   to an auth with `stay_within_free: false` only where paid usage is
    approved. A refusal caused only by recent admissions is a retryable 429
    `rate_limit` (at most 10 minutes); only a measured reading that leaves no
    room returns `quota_exhausted` until 00:00 UTC.

@@ -106,8 +106,10 @@ without it):
   30 s. Definitive verdicts are cached per account/token digest for 6 h;
   inconclusive models are re-probed on the next discovery.
 - Each probe uses only a few neurons. With `stay_within_free` on, each probe goes
-  through the hard stop like inference (each is charged about 20 neurons or less). A
-  refused probe is not sent, and the model stays listed. The plugin never submits a model
+  through the hard stop like inference (charged by the same estimate, with
+  `max_tokens: 1`). A refused probe is not sent, and the model stays listed.
+  A model without a published neuron price is never advertised or served while
+  the hard stop is on: it is dropped from the catalog without a probe. The plugin never submits a model
   license agreement (`agree`) on the operator's behalf; accept it yourself and
   the model is advertised after the cached verdict expires or the plugin reloads.
 
@@ -129,14 +131,13 @@ POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/compl
 Authorization: Bearer <workers-ai-api-token>
 ```
 
-The final host-translated OpenAI payload is preserved, with three exceptions:
-the model prefix is removed, the stream flag is set to match the execution
-method, and, with `stay_within_free` on, the output limit is normalised:
-`max_tokens` is set to the lower of `max_tokens` and `max_completion_tokens`
-when given, else 4,096, and a given `max_completion_tokens` is set to the same
-value. The hard stop charges exactly this cap. With `stay_within_free` on, some
-requests are refused before dispatch (see
-[Free-only hard stop](#free-only-hard-stop)). Streams
+With `stay_within_free: false`, the final host-translated OpenAI payload is
+preserved with two exceptions: the model prefix is removed, and the stream flag
+is set to match the execution method (a raw `HttpRequest` keeps the body's own
+flag). With `stay_within_free` on (the default), the upstream body is
+**rebuilt** from an allowlisted, text-only request shape instead (see
+[Accepted request shape](#accepted-request-shape-with-the-hard-stop-on)); the
+estimate is computed from exactly the rebuilt bytes. Streams
 are relayed incrementally. All inference/discovery requests use the injected
 **host HTTP client**. Arbitrary raw-HTTP destinations, methods and caller
 credentials are not forwarded. Token counting is local and explicitly estimated.
@@ -236,34 +237,64 @@ reading + tally + estimate + safety_margin_neurons < daily_free_neurons
   **10 minutes** stays charged at its estimate, even after a newer reading may
   already include it. Counting a request twice is safe; missing one is not.
   Entries from just before midnight still count after it, which is also safe.
-- **estimate**: `ceil((body_bytes × input_rate + max_output × output_rate) / 1e6)`.
-  The rates are the model's neurons per million tokens from the official
+- **estimate**: `ceil(((body_bytes + 512) × input_rate + max_tokens × output_rate) / 1e6)`.
+  `body_bytes` is the length of the rebuilt upstream body, the exact bytes
+  sent; 512 input tokens cover the model's chat template; `max_tokens` is the
+  integer written into that body. The rates are the model's neurons per million
+  tokens from the official
   [pricing table](https://developers.cloudflare.com/workers-ai/platform/pricing/)
-  (retrieved 2026-11-01). A model not in the table gets the highest input and
-  highest output rate in the table (127,273 / 606,061). With text-only content
-  every token is at least one byte, so the upstream body's byte length bounds
-  the prompt tokens; JSON framing only overcounts. `max_output` is the
-  normalised output cap (see the output cap above). Cached input is charged at
-  the uncached rate.
+  (retrieved 2026-11-01). A model not in the table is refused (`invalid_model`,
+  HTTP 400) and not advertised: it cannot be bounded. With text-only content
+  every token is at least one byte, so the body's byte length bounds the
+  prompt tokens; JSON framing only overcounts. Cached input is charged at the
+  uncached rate.
 
-Requests the estimate cannot bound are refused before any analytics read or
-dispatch, with `invalid_request` (HTTP 400, not retryable, no cooldown):
+#### Accepted request shape with the hard stop on
 
-- a message content part whose `type` is not `"text"` (`image_url`, remote or
-  data-URI; `input_audio`; `file`; a part without a type), content that is
-  neither a string, `null` nor an array of parts, or a top-level `image` or
-  `audio` input. Images and audio can expand to far more tokens than bytes;
-- `max_tokens` or `max_completion_tokens` that is present but not an integer of
-  at least 1 (for example `0.0001`, `1.5`, `0` or `"many"`); `null` counts as
-  absent;
-- `n` or `best_of` other than 1 (each extra completion multiplies output).
+The client body is decoded **once**, with exact, case-sensitive keys, and the
+upstream body is re-marshalled from those decoded values. The guard and
+Cloudflare therefore read the same request: there is no second parse of the
+client body in which Go's case-insensitive field matching, Unicode case folding
+(the Kelvin sign `K` U+212A as `k`, long s `ſ` U+017F as `s`) or a duplicate key
+could make the two disagree. Only this text-only shape is accepted; anything
+else is refused before any analytics read or dispatch with `invalid_request`
+(HTTP 400, not retryable, no cooldown):
+
+- **Top-level keys**, exactly: `model`, `messages`, `max_tokens`,
+  `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
+  `stream`, `stream_options`, `frequency_penalty`, `presence_penalty`,
+  `repetition_penalty`, `response_format`, `tools`, `tool_choice`, plus `n` and
+  `best_of` only with the value `1` (not forwarded). Any other key (for
+  example `prompt`, `image`, `audio`, `raw`, `lora`, `logprobs`), any case
+  variant (`Max_Tokens`, `max_toKens` with U+212A) and any key given twice is
+  refused.
+- **Messages**: an array of objects with only the keys `role` (string,
+  required), `content`, `name` (string), `tool_calls` (array) and
+  `tool_call_id` (string), each at most once, exact case.
+- **Content**: a string, `null`, or an array of parts that are each exactly
+  `{"type":"text","text":<string>}` (no other keys, no case variants).
+  `image_url`, `input_audio`, `file` or any other part is refused: images and
+  audio can expand to far more tokens than their bytes.
+- **Output limit**: `max_tokens` and `max_completion_tokens`, when present and
+  not `null`, must be integers of at least 1 (`0.0001`, `1.5`, `0`, `"5"` and
+  `1e300` are refused). The rebuilt body carries one `max_tokens`: the lower of
+  the two given, else 4,096; `max_completion_tokens` is not forwarded.
+- The rebuilt body contains only these fields with lowercase keys: `model`
+  (prefix removed), `stream` (the execution method's flag; for a raw
+  `HttpRequest`, the body's boolean `stream`), `max_tokens`, the rebuilt
+  `messages`, and the other allowlisted fields' decoded JSON values. Every byte
+  of those values is charged as input.
+
+Callers that need another shape need an auth with `stay_within_free: false`,
+which forwards the payload as before; use it only where paid usage is approved.
 
 Refusals never reach Cloudflare:
 
 | Condition | Plugin error | Retry hint |
 | --- | --- | --- |
 | `estimate + safety_margin_neurons >= daily_free_neurons` (cannot fit even at zero usage) | `request_too_large`, HTTP 400 | None; lower `max_tokens` or the prompt |
-| Unbounded request shape (list above) | `invalid_request`, HTTP 400 | None; send text only, an integer limit and one completion |
+| Request shape outside the allowlist (see above) | `invalid_request`, HTTP 400 | None; send the accepted text-only shape |
+| Model without a published neuron price | `invalid_model`, HTTP 400 | None; use a priced model |
 | `reading + estimate + safety_margin_neurons >= daily_free_neurons` (the reading alone leaves no room) | `quota_exhausted`, HTTP 429, non-retryable | Until next 00:00 UTC |
 | Only the tally pushes the check over | `rate_limit`, HTTP 429, retryable | Until the oldest tally entry leaves the 10-minute window (at most 10 minutes) |
 | No reading, failed read, reading older than 2 minutes, unknown host proxy, or read across midnight | `quota_unverified`, HTTP 503 | 60 seconds |

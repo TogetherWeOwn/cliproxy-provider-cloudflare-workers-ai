@@ -9,13 +9,13 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	kit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -41,26 +41,12 @@ type analyticsFixture struct {
 	delay   time.Duration
 }
 
-// serverDoer is the guard's analytics client in tests: it sends Cloudflare
-// API URLs to the loopback server and refuses everything else.
-type serverDoer struct{ server *httptest.Server }
-
-func (d serverDoer) Do(req *http.Request) (*http.Response, error) {
-	if !strings.HasPrefix(req.URL.String(), upstreamBase+"/") {
-		return nil, fmt.Errorf("unexpected analytics destination")
-	}
-	out := req.Clone(req.Context())
-	u, err := url.Parse(d.server.URL + strings.TrimPrefix(req.URL.String(), upstreamBase))
-	if err != nil {
-		return nil, err
-	}
-	out.URL, out.Host, out.RequestURI = u, u.Host, ""
-	return d.server.Client().Do(out)
-}
-
-// testGuard reads analytics from server and has seen a host without a proxy.
+// testGuard reads analytics from the loopback server and has seen a host
+// without a proxy. Its endpoint is the server itself, so no test guard can
+// reach the real API.
 func testGuard(server *httptest.Server) *freeGuard {
-	g := newFreeGuard(serverDoer{server})
+	g := newFreeGuard(server.Client())
+	g.endpoint = server.URL + "/client/v4/graphql"
 	g.observeHost(pluginapi.HostConfigSummary{})
 	return g
 }
@@ -413,140 +399,6 @@ func TestExecutorRefusesBeforeDispatchOnEveryPath(t *testing.T) {
 	}
 }
 
-func TestExecutorBoundsOutputAndBypassesWhenOptedOut(t *testing.T) {
-	var mu sync.Mutex
-	var bodies []map[string]any
-	var graphql atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/client/v4/graphql" {
-			graphql.Add(1)
-			io.WriteString(w, analyticsBody(`[]`))
-			return
-		}
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		mu.Lock()
-		bodies = append(bodies, body)
-		mu.Unlock()
-		io.WriteString(w, `{"choices":[]}`)
-	}))
-	defer server.Close()
-	ex := newExecutor(testGuard(server))
-	run := func(payload string, metadata map[string]any) map[string]any {
-		t.Helper()
-		mu.Lock()
-		bodies = nil
-		mu.Unlock()
-		_, err := ex.Execute(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(payload), StorageJSON: authJSON(testAccount, "example-key"), AuthMetadata: metadata, HTTPClient: mockHostClient{server}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if len(bodies) != 1 {
-			t.Fatalf("%d upstream requests", len(bodies))
-		}
-		return bodies[0]
-	}
-	const model = `"model":"cloudflare/@cf/openai/gpt-oss-20b"`
-	// Both limits go upstream as the one integer the estimate charged.
-	for _, tc := range []struct {
-		payload               string
-		maxTokens, completion any
-	}{
-		{`{` + model + `}`, float64(defaultMaxOutputTokens), nil},
-		{`{` + model + `,"max_tokens":null,"max_completion_tokens":null}`, float64(defaultMaxOutputTokens), nil},
-		{`{` + model + `,"max_tokens":12.0}`, float64(12), nil},
-		{`{` + model + `,"max_completion_tokens":77}`, float64(77), float64(77)},
-		{`{` + model + `,"max_tokens":10,"max_completion_tokens":77}`, float64(10), float64(10)},
-		{`{` + model + `,"max_tokens":90,"max_completion_tokens":20}`, float64(20), float64(20)},
-	} {
-		body := run(tc.payload, nil)
-		if body["max_tokens"] != tc.maxTokens || body["max_completion_tokens"] != tc.completion {
-			t.Fatalf("%s: max_tokens %v max_completion_tokens %v", tc.payload, body["max_tokens"], body["max_completion_tokens"])
-		}
-		raw, _ := json.Marshal(body)
-		if got, want := estimateNeurons(raw), math.Ceil((float64(len(raw))*18182+tc.maxTokens.(float64)*27273)/1e6); got != want {
-			t.Fatalf("%s: estimate %v, want %v for the forwarded limit", tc.payload, got, want)
-		}
-	}
-	if graphql.Load() != 1 {
-		t.Fatalf("guarded reads %d, want one cached read", graphql.Load())
-	}
-	// Opted out: today's behaviour, no analytics read and no output cap.
-	body := run(`{`+model+`}`, map[string]any{"stay_within_free": false})
-	if _, set := body["max_tokens"]; set || graphql.Load() != 1 {
-		t.Fatalf("opt-out still guarded: %v reads=%d", body, graphql.Load())
-	}
-	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/client/v4/graphql" {
-			w.WriteHeader(500)
-			return
-		}
-		io.WriteString(w, `{"choices":[]}`)
-	}))
-	defer failing.Close()
-	if _, err := newExecutor(testGuard(failing)).Execute(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(`{` + model + `}`), StorageJSON: authJSON(testAccount, "example-key"), AuthMetadata: map[string]any{"stay_within_free": false}, HTTPClient: mockHostClient{failing}}); err != nil {
-		t.Fatalf("opt-out depends on analytics: %v", err)
-	}
-}
-
-func TestExecutorRefusesRequestsTheEstimateCannotBound(t *testing.T) {
-	var upstream atomic.Int32
-	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstream.Add(1)
-		io.WriteString(w, `{"choices":[]}`)
-	})))
-	defer server.Close()
-	ex := newExecutor(testGuard(server))
-	exec := func(payload string, metadata map[string]any) error {
-		_, err := ex.Execute(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(payload), StorageJSON: authJSON(testAccount, "example-key"), AuthMetadata: metadata, HTTPClient: mockHostClient{server}})
-		return err
-	}
-	const model = `"model":"cloudflare/@cf/meta/llama-3.2-11b-vision-instruct"`
-	refused := []string{
-		// B2: fractional or otherwise non-integer limits.
-		`"max_tokens":0.0001`, `"max_tokens":1.5`, `"max_tokens":0`, `"max_tokens":-5`, `"max_tokens":"many"`, `"max_tokens":true`, `"max_tokens":1e300`,
-		`"max_completion_tokens":0.5`, `"max_tokens":10,"max_completion_tokens":0.5`,
-		// B3: several completions per request.
-		`"n":2`, `"n":64`, `"n":"2"`, `"n":0`, `"best_of":3`,
-		// B1: content the body length does not bound.
-		`"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"https://example.invalid/cat.png"}}]}]`,
-		`"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]`,
-		`"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}]`,
-		`"messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"f"}}]}]`,
-		`"messages":[{"role":"user","content":[{"text":"no type"}]}]`,
-		`"messages":[{"role":"user","content":{"type":"image_url"}}]`,
-		`"messages":{"role":"user"}`,
-		`"image":[1,2,3]`, `"audio":{"voice":"alloy"}`,
-	}
-	for _, field := range refused {
-		payload := `{` + model + `,` + field + `}`
-		e := wantCode(t, exec(payload, nil), "invalid_request")
-		if e.HTTPStatus != http.StatusBadRequest || e.Retryable {
-			t.Fatalf("%s: refusal %+v", field, e)
-		}
-		// Opted out, the request is forwarded unchanged as before.
-		if err := exec(payload, map[string]any{"stay_within_free": false}); err != nil {
-			t.Fatalf("%s: opt-out refused: %v", field, err)
-		}
-	}
-	if upstream.Load() != int32(len(refused)) {
-		t.Fatalf("%d upstream requests, want only the %d opted-out ones", upstream.Load(), len(refused))
-	}
-	for _, field := range []string{
-		`"n":1`, `"best_of":null`, `"max_tokens":5`,
-		`"messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":null,"tool_calls":[]}]`,
-	} {
-		if err := exec(`{`+model+`,`+field+`}`, nil); err != nil {
-			t.Fatalf("%s: text-only request refused: %v", field, err)
-		}
-	}
-}
-
-// The executor's host HTTP client records each request, bearer header
-// included, into the inference request's API log and marks it as an upstream
-// attempt. The analytics read must never go through it.
 func TestGuardReadsAnalyticsWithoutTheHostClient(t *testing.T) {
 	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"choices":[]}`)
@@ -582,15 +434,78 @@ func (h *recordingHost) urls() []string {
 	return append([]string(nil), h.seen...)
 }
 
+// The read must never be sent direct while the host's proxy-url is unknown.
+// A recording transport sees every attempted analytics request and the proxy
+// the kit transport would use for it; it never dials.
+type recordingTransport struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	via := "inherit"
+	if u, err := kit.QuotaProxy(r); err != nil {
+		via = "invalid"
+	} else if u != nil {
+		via = u.String()
+	}
+	rt.mu.Lock()
+	rt.seen = append(rt.seen, r.Method+" "+r.URL.String()+" via "+via)
+	rt.mu.Unlock()
+	return nil, errors.New("recording transport never dials")
+}
+func (rt *recordingTransport) requests() []string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return append([]string(nil), rt.seen...)
+}
+
+const unroutableAnalytics = "http://127.0.0.1:1/client/v4/graphql"
+
 func TestGuardReadFollowsAuthThenHostProxyAndNeverGuessesDirect(t *testing.T) {
+	// Loopback discard ports: recorded only, never dialled.
+	authProxy, hostProxy := "http://127.0.0.1:9", "http://127.0.0.2:9"
+	rt := &recordingTransport{}
+	g := newFreeGuard(&http.Client{Transport: rt})
+	g.endpoint = unroutableAnalytics
+	viaAuth := freeCredentials(t, map[string]any{"proxy_url": authProxy})
+	plain := freeCredentials(t, nil)
+	// Before the host's proxy-url is known, an auth without its own proxy is
+	// refused without any analytics attempt, and nothing is dispatched.
+	var chats atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { chats.Add(1) }))
+	defer server.Close()
+	_, err := newExecutor(g).Execute(context.Background(), pluginapi.ExecutorRequest{Payload: []byte(`{"model":"cloudflare/@cf/openai/gpt-oss-20b","max_tokens":1}`), StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}})
+	wantCode(t, err, "quota_unverified")
+	wantCode(t, g.admit(context.Background(), plain, 1), "quota_unverified")
+	if got := rt.requests(); len(got) != 0 || chats.Load() != 0 {
+		t.Fatalf("attempted %v and %d chats before the host proxy was known", got, chats.Load())
+	}
+	// The auth's own proxy, then the host's, then an invalid setting.
+	wantCode(t, g.admit(context.Background(), viaAuth, 1), "quota_unverified")
+	g.observeHost(pluginapi.HostConfigSummary{ProxyURL: hostProxy})
+	wantCode(t, g.admit(context.Background(), plain, 1), "quota_unverified")
+	g.observeHost(pluginapi.HostConfigSummary{ProxyURL: "not a proxy"})
+	wantCode(t, g.admit(context.Background(), plain, 1), "quota_unverified")
+	want := []string{"POST " + unroutableAnalytics + " via " + authProxy, "POST " + unroutableAnalytics + " via " + hostProxy, "POST " + unroutableAnalytics + " via invalid"}
+	if got := rt.requests(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("analytics attempts\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if chats.Load() != 0 {
+		t.Fatal("dispatched without a verified reading")
+	}
+}
+
+// The plugin's real analytics client sends the read through the chosen proxy.
+func TestGuardReadUsesTheProxyWithTheRealTransport(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string][]string{}
 	proxy := func(name string) string {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
-			seen[name] = append(seen[name], r.Method+" "+r.Host)
+			seen[name] = append(seen[name], r.Method+" "+r.URL.String())
 			mu.Unlock()
-			// Never tunnel: the read fails closed and nothing leaves loopback.
+			// Never forward: the read fails closed and nothing leaves loopback.
 			w.WriteHeader(http.StatusForbidden)
 		}))
 		t.Cleanup(s.Close)
@@ -600,20 +515,13 @@ func TestGuardReadFollowsAuthThenHostProxyAndNeverGuessesDirect(t *testing.T) {
 	client := newAnalyticsClient()
 	defer client.CloseIdleConnections()
 	g := newFreeGuard(client)
-	viaAuth := freeCredentials(t, map[string]any{"proxy_url": authProxy})
-	plain := freeCredentials(t, nil)
-	// Before the host's proxy-url is known, an auth without its own proxy is
-	// refused without any request.
-	wantCode(t, g.admit(context.Background(), plain, 1), "quota_unverified")
+	g.endpoint = unroutableAnalytics
+	wantCode(t, g.admit(context.Background(), freeCredentials(t, map[string]any{"proxy_url": authProxy}), 1), "quota_unverified")
 	g.observeHost(pluginapi.HostConfigSummary{ProxyURL: hostProxy})
-	wantCode(t, g.admit(context.Background(), plain, 1), "quota_unverified")
-	g = newFreeGuard(client)
-	wantCode(t, g.admit(context.Background(), viaAuth, 1), "quota_unverified")
-	g.observeHost(pluginapi.HostConfigSummary{ProxyURL: "not a proxy"})
-	wantCode(t, g.admit(context.Background(), plain, 1), "quota_unverified")
+	wantCode(t, g.admit(context.Background(), freeCredentials(t, nil), 1), "quota_unverified")
 	mu.Lock()
 	defer mu.Unlock()
-	want := "CONNECT api.cloudflare.com:443"
+	want := "POST " + unroutableAnalytics
 	if len(seen["host"]) != 1 || seen["host"][0] != want || len(seen["auth"]) != 1 || seen["auth"][0] != want {
 		t.Fatalf("proxies saw %v", seen)
 	}
@@ -623,7 +531,7 @@ func TestProbesRefusedByTheGuardAreNotSent(t *testing.T) {
 	var probes atomic.Int32
 	server := httptest.NewServer(withAnalytics(9999, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
-			io.WriteString(w, `{"success":true,"errors":[],"result":[{"name":"@cf/org/a","task":{"name":"Text Generation"}},{"name":"@cf/org/b","task":{"name":"Text Generation"}}],"result_info":{"page":1,"total_pages":1}}`)
+			io.WriteString(w, `{"success":true,"errors":[],"result":[{"name":"@cf/openai/gpt-oss-20b","task":{"name":"Text Generation"}},{"name":"@cf/qwen/qwen3-30b-a3b-fp8","task":{"name":"Text Generation"}}],"result_info":{"page":1,"total_pages":1}}`)
 			return
 		}
 		probes.Add(1)
@@ -636,26 +544,14 @@ func TestProbesRefusedByTheGuardAreNotSent(t *testing.T) {
 	}
 }
 
-func TestEstimateBoundsPromptAndOutput(t *testing.T) {
-	body := []byte(`{"model":"@cf/openai/gpt-oss-120b","max_tokens":1000}`)
-	want := math.Ceil((float64(len(body))*31818 + 1000*68182) / 1e6)
-	if got := estimateNeurons(body); got != want {
-		t.Fatalf("known model %v, want %v", got, want)
+func TestEstimateBoundsPromptTemplateAndOutput(t *testing.T) {
+	body := []byte(`{"max_tokens":1000,"model":"@cf/openai/gpt-oss-120b","stream":false}`)
+	want := math.Ceil((float64(len(body)+512)*31818 + 1000*68182) / 1e6)
+	if got := estimateNeurons(neuronRates["@cf/openai/gpt-oss-120b"], body, 1000); got != want {
+		t.Fatalf("estimate %v, want %v", got, want)
 	}
-	unknown := []byte(`{"model":"@cf/new/model","max_completion_tokens":1000}`)
-	if worstNeuronRate.input != 127273 || worstNeuronRate.output != 606061 {
-		t.Fatalf("worst rate %+v", worstNeuronRate)
-	}
-	if got := estimateNeurons(unknown); got != math.Ceil((float64(len(unknown))*127273+1000*606061)/1e6) {
-		t.Fatalf("unknown model %v", got)
-	}
-	for _, raw := range []string{`{"model":"@cf/openai/gpt-oss-120b"}`, `{"model":"@cf/openai/gpt-oss-120b","max_tokens":0}`, `{"model":"@cf/openai/gpt-oss-120b","max_tokens":-5}`, `{"model":"@cf/openai/gpt-oss-120b","max_tokens":0.0001}`, `{"model":"@cf/openai/gpt-oss-120b","max_tokens":5,"max_completion_tokens":0.5}`, `[`} {
-		if !math.IsInf(estimateNeurons([]byte(raw)), 1) {
-			t.Fatalf("unbounded %s was estimated", raw)
-		}
-	}
-	probe := probeBody("@cf/new/model")
-	if got := estimateNeurons(probe); got != math.Ceil((float64(len(probe))*127273+606061)/1e6) || got > 20 {
+	probe := probeBody("@cf/openai/gpt-oss-20b")
+	if got := estimateNeurons(neuronRates["@cf/openai/gpt-oss-20b"], probe, 1); got != math.Ceil((float64(len(probe)+512)*18182+27273)/1e6) {
 		t.Fatalf("probe estimate %v", got)
 	}
 }

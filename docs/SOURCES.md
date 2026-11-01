@@ -49,7 +49,7 @@ the fallback uses the documented `-fp8` variant.
 | Live schema can be inspected with introspection | operator verification step | [Introspection](https://developers.cloudflare.com/analytics/graphql-api/features/discovery/introspection/) |
 | Dataset `aiInferenceAdaptiveGroups` ("Aggregated AI Inference logs with adaptive sampling"), filter fields `date_geq: Date` / `date_leq: Date`, `sum.totalNeurons: float64!` | the exact selection in `neuronQuery` | **No official page publishes this field/filter combination.** Corroborated by a public third-party snapshot of the live schema: [Cloudflare GraphQL schema docs](https://pages.johnspurlock.com/graphql-schema-docs/cloudflare.html) (`AccountAiInferenceAdaptiveGroupsFilter_InputObject`, `AccountAiInferenceAdaptiveGroupsSum`). Pending live verification. |
 | Adaptive datasets are sampled | card description says "delayed and sampled"; the hard stop's safety margin absorbs sampling error | dataset description in the schema snapshot above |
-| Per-model LLM rates in neurons per million input/output tokens (retrieved 2026-11-01) | `neuronRates` in `guard.go`; unknown models use the table's highest input and output rate | [Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) |
+| Per-model LLM rates in neurons per million input/output tokens (retrieved 2026-11-01) | `neuronRates` in `guard.go`; with the hard stop on, a model missing from the table is refused and not advertised | [Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) |
 
 ### Deviation from the ported query
 
