@@ -3,9 +3,9 @@
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, a **daily neuron quota card** and a
 **free-only hard stop** that is on by default. Uses the
-[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `c81b686`
-and the real **CLIProxyAPI v8.0.48** C-ABI loader (ABI 1, RPC schema 9). The kit refuses only older hosts, so newer hosts such as
-v8.0.49 (RPC schema 10) also load it.
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `21069bf`
+and the real **CLIProxyAPI v8.0.49** C-ABI loader (ABI 1, RPC schema 10). Requires CLIProxyAPI
+**v8.0.49 or newer**: the kit refuses hosts older than RPC schema 10.
 
 Multiple auth files use native routing (`round-robin`, weighted routing or
 fill-first) and native per-auth/model cooldown. There is **no Scheduler** and no
@@ -365,7 +365,7 @@ Daily hints can be extended by a longer upstream `Retry-After`. Bodies, account
 IDs, tokens and transport diagnostics never appear in public plugin errors.
 These mappings drive **reactive native cooldown**, not plugin account selection.
 
-The v8.0.48 RPC error adapter carries status/retry timing but **drops `retryable`
+The v8.0.49 RPC error adapter carries status/retry timing but **drops `retryable`
 and the native transient-rate-limit marker**. Consequently a transient 3040
 still sets model quota-exceeded state, although the short retry timing survives.
 The real-loader test characterizes this limitation and separately proves daily
@@ -389,13 +389,13 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.4_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.1.5_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.
 Registry metadata is not a claim that a release has already been published.
 
-CI checks formatting, vet, race tests, packaging/glibc, real v8.0.48 loading,
+CI checks formatting, vet, race tests, packaging/glibc, real v8.0.49 loading,
 gitleaks and public-file hygiene. The `hostcompat` build tag permits only
 loopback mock upstreams and is **test-only**; never release that binary.
 
