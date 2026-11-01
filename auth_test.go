@@ -17,7 +17,10 @@ func authJSON(account, key string) []byte {
 	return raw
 }
 func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
-	p := newAuthProvider(nil)
+	p, err := newAuthProvider(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	parse := func(file, account, key string) (pluginapi.AuthParseResponse, error) {
 		return p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{FileName: file, RawJSON: authJSON(account, key)})
 	}
@@ -53,12 +56,16 @@ func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
 	if _, err = p.StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{}); err == nil {
 		t.Fatal("offered OAuth")
 	}
-	if _, err = p.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{}); err == nil {
-		t.Fatal("polled OAuth")
+	// Login is the API-key page flow now: an unknown state never yields an auth.
+	if polled, err := p.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{}); err != nil || polled.Status != pluginapi.AuthLoginStatusError || polled.Auth.ID != "" {
+		t.Fatal("polled an unknown login state", polled, err)
 	}
 }
 func TestAuthValidationAndMetadataPrecedence(t *testing.T) {
-	p := newAuthProvider(nil)
+	p, err := newAuthProvider(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, raw := range []string{
 		`{}`, `{"type":"cloudflare-workers-ai","api_key":"example-key"}`, `{"type":"cloudflare-workers-ai","account_id":"../escape","api_key":"example-key"}`,
 		string(authJSON(testAccount, "")),

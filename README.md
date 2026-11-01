@@ -88,8 +88,24 @@ before reusing an identity in another filename.
 
 Different API tokens on **one account share the same daily allocation**. Their
 cards report the same account-wide consumption; never add these capacities as
-independent entitlements. Login/poll report API-key-only; refresh preserves the
-record and makes no upstream call.
+independent entitlements. Refresh preserves the record and makes no upstream
+call.
+
+## Management-UI login
+
+The management UI's login card serves a kit login page that displays a shell
+block. Paste it into `bash` or `zsh`; the terminal then prompts for the API
+token, the Cloudflare account ID and the optional separate analytics token, then
+submits them over an authenticated management POST (the API token travels in
+the POST body and the management key in the `Authorization` header, never in
+URLs, logs or process arguments). The submission runs the
+same ParseAuth validation and duplicate-auth guard as an uploaded auth file, so
+submitting the same account and token twice is idempotent. On a remote host, set
+`CLIPROXY_BASE` to an `https://` base so secrets are encrypted in transit.
+
+The numeric tunables (`daily_free_neurons`, `safety_margin_neurons`,
+`cold_start_hold_seconds`) and `stay_within_free` are not on the login page and
+must be added by editing the stored auth file afterwards.
 
 ## Models and execution
 
@@ -390,7 +406,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.1.5_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.2.0_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.
