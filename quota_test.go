@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	providerkit "github.com/TogetherWeOwn/cliproxy-provider-kit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -84,15 +85,17 @@ func TestDailyQuotaUsesAccountWideUTCNeuronsAndSeparateAnalyticsToken(t *testing
 			t.Fatalf("quota %v %v", out, err)
 		}
 		b := out.Groups[0].Buckets[0]
-		if b.Window != "daily" || b.RemainingFraction != 0 || b.ResetTime != "2030-01-02T00:00:00Z" {
+		if b.Window != "Daily free neurons · 12500 of 10000 used" || b.Description != "" ||
+			b.RemainingFraction != 0 || b.ResetTime != "2030-01-02T00:00:00Z" {
 			t.Fatalf("bad bucket %+v", b)
 		}
-		metrics := map[string]float64{}
-		for _, m := range out.Summary {
-			metrics[m.Key] = m.Value
+		// Only the overage gets a chip; the allocation and used numbers are
+		// already in the row label.
+		if len(out.Summary) != 1 || out.Summary[0].Key != "neurons_above_free" || out.Summary[0].Value != 2500 {
+			t.Fatalf("bad summary %v", out.Summary)
 		}
-		if metrics["daily_free_neurons"] != 10000 || metrics["neurons_used_today"] != 12500 || metrics["neurons_above_free"] != 2500 {
-			t.Fatalf("bad summary %v", metrics)
+		if v := providerkit.CheckCard(out); len(v) != 0 {
+			t.Fatalf("card style violations: %v", v)
 		}
 	}
 	if polls.Load() != 1 {
@@ -100,7 +103,7 @@ func TestDailyQuotaUsesAccountWideUTCNeuronsAndSeparateAnalyticsToken(t *testing
 	}
 	req.Metadata["daily_free_neurons"] = float64(25000)
 	out, err := q.FetchQuota(context.Background(), req)
-	if err != nil || out.Groups[0].Buckets[0].RemainingFraction != .5 || polls.Load() != 2 {
+	if err != nil || out.Groups[0].Buckets[0].RemainingFraction != .5 || len(out.Summary) != 0 || polls.Load() != 2 {
 		t.Fatal("capacity change cached incorrectly", err)
 	}
 	desc, err := q.DescribeQuota(context.Background(), pluginapi.QuotaDescribeRequest{})
