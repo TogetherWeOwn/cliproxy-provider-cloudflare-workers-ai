@@ -112,7 +112,7 @@ authorization and are performed by an operator, not by this repository:
 
 1. Auth parse and persistence; duplicate-file rejection; stable auth ID across
    a reload of the same file.
-2. Quota card: one `Daily free neurons` bucket with no description, reset at
+2. Quota card: one `daily` bucket (the free-neurons allowance) with no description, reset at
    the next `00:00:00Z`, remaining fraction matching the dashboard's Workers
    AI usage within analytics delay. The summary is empty unless the account is
    above its free allocation, in which case one `Above free allocation` chip

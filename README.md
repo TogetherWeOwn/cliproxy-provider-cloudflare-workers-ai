@@ -202,7 +202,7 @@ field/filter combination in a static Workers AI example. **Do not mistake mock/s
 successful live GraphQL canary.** See the explicit evidence boundary in
 [Sources](docs/SOURCES.md).
 
-One group contains one `window: Daily free neurons` bucket with no description:
+One group contains one `window: daily` bucket (the free-neurons allowance) with no description:
 
 - remaining fraction: `max(0, 1 - used/capacity)` from today's analytics
   `sum.totalNeurons` against the configured daily free neurons;
