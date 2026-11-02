@@ -17,6 +17,7 @@ import (
 
 const (
 	provider            = "cloudflare-workers-ai"
+	displayName         = "Cloudflare Workers AI"
 	version             = "0.2.3"
 	modelPrefix         = "cloudflare/"
 	upstreamBase        = "https://api.cloudflare.com"
