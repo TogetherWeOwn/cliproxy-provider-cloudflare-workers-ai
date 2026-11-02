@@ -17,10 +17,7 @@ func authJSON(account, key string) []byte {
 	return raw
 }
 func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
-	p, err := newAuthProvider(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := newAuthProvider(nil)
 	parse := func(file, account, key string) (pluginapi.AuthParseResponse, error) {
 		return p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{FileName: file, RawJSON: authJSON(account, key)})
 	}
@@ -53,19 +50,18 @@ func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
 	if err != nil || string(refreshed.Auth.StorageJSON) != string(a.Auth.StorageJSON) {
 		t.Fatal("refresh changed credentials", err)
 	}
+	// API-key only: no login page is registered, so both calls fail with
+	// api_key_only. Auth files load through the host's generic file path;
+	// the hostcompat test proves that path end to end.
 	if _, err = p.StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{}); err == nil {
-		t.Fatal("offered OAuth")
+		t.Fatal("login started for an API-key-only provider")
 	}
-	// Login is the API-key page flow now: an unknown state never yields an auth.
-	if polled, err := p.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{}); err != nil || polled.Status != pluginapi.AuthLoginStatusError || polled.Auth.ID != "" {
-		t.Fatal("polled an unknown login state", polled, err)
+	if polled, err := p.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{}); err == nil && polled.Status == pluginapi.AuthLoginStatusSuccess {
+		t.Fatal("polled an unknown login state", polled)
 	}
 }
 func TestAuthValidationAndMetadataPrecedence(t *testing.T) {
-	p, err := newAuthProvider(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := newAuthProvider(nil)
 	for _, raw := range []string{
 		`{}`, `{"type":"cloudflare-workers-ai","api_key":"example-key"}`, `{"type":"cloudflare-workers-ai","account_id":"../escape","api_key":"example-key"}`,
 		string(authJSON(testAccount, "")),

@@ -24,16 +24,15 @@ func makePlugin(host kit.Caller) (*kit.Runtime, error) {
 	guard := newFreeGuard(client)
 	guard.started = time.Now()
 	models := newCatalog(guard)
-	auth, err := newAuthProvider(guard)
-	if err != nil {
-		return nil, err
-	}
+	// API-key only (TWO-1257): no AuthProvider and no ManagementAPI login
+	// routes, so the management UI shows no login card. Auth files load
+	// through the host's generic file path.
 	return kit.New(kit.Definition{
 		Metadata:       pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai", Logo: "https://www.google.com/s2/favicons?domain=cloudflare.com"},
 		ModelNamespace: "cloudflare",
 		Configure:      configureBase,
 		Capabilities: pluginapi.Capabilities{
-			AuthProvider: auth, ManagementAPI: auth.Login, ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(guard),
+			ModelRegistrar: models, ModelProvider: models, Executor: newExecutor(guard),
 			ExecutorModelScope:   pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,
 		},
