@@ -29,7 +29,7 @@ func makePlugin(host kit.Caller) (*kit.Runtime, error) {
 		return nil, err
 	}
 	return kit.New(kit.Definition{
-		Metadata:       pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai"},
+		Metadata:       pluginapi.Metadata{Name: provider, Version: version, Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-cloudflare-workers-ai", Logo: "https://www.google.com/s2/favicons?domain=cloudflare.com"},
 		ModelNamespace: "cloudflare",
 		Configure:      configureBase,
 		Capabilities: pluginapi.Capabilities{
