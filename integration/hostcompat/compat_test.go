@@ -222,7 +222,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.2.2" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.2.3" {
 		t.Fatalf("metadata %+v", info)
 	}
 	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
@@ -247,7 +247,7 @@ func TestRealHostLoader(t *testing.T) {
 	quotaReq := pluginapi.QuotaFetchRequest{AuthID: auth.ID, Provider: provider, StorageJSON: saved}
 	for i := 0; i < 2; i++ {
 		quota, handled, err := host.FetchQuota(ctx, quotaReq)
-		if err != nil || !handled || len(quota.Groups) != 1 || quota.Groups[0].Buckets[0].RemainingFraction != .25 || quota.Groups[0].Buckets[0].Window != "Daily free neurons" || quota.Groups[0].Buckets[0].Description != "" || len(quota.Summary) != 0 || polls.Load() != 1 {
+		if err != nil || !handled || len(quota.Groups) != 1 || quota.Groups[0].Buckets[0].RemainingFraction != .25 || quota.Groups[0].Buckets[0].Window != "daily" || quota.Groups[0].Buckets[0].Description != "" || len(quota.Summary) != 0 || polls.Load() != 1 {
 			t.Fatalf("quota %+v %v polls=%d", quota, err, polls.Load())
 		}
 	}
@@ -463,7 +463,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.2.2" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.2.3" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }

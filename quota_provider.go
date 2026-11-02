@@ -69,7 +69,7 @@ func normalizeQuota(used, capacity float64, now time.Time) (pluginapi.QuotaFetch
 	}
 	return pluginapi.QuotaFetchResponse{
 		Groups: []pluginapi.QuotaGroup{{DisplayName: "Cloudflare Workers AI", Buckets: []pluginapi.QuotaBucket{{
-			Window: "Daily free neurons", RemainingFraction: math.Max(0, 1-used/capacity), ResetTime: nextReset(now).Format(time.RFC3339),
+			Window: "daily", RemainingFraction: math.Max(0, 1-used/capacity), ResetTime: nextReset(now).Format(time.RFC3339),
 		}}}},
 		Summary: aboveFree(used, capacity),
 	}, nil

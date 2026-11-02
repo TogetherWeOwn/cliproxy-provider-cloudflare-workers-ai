@@ -202,7 +202,7 @@ field/filter combination in a static Workers AI example. **Do not mistake mock/s
 successful live GraphQL canary.** See the explicit evidence boundary in
 [Sources](docs/SOURCES.md).
 
-One group contains one `window: Daily free neurons` bucket with no description:
+One group contains one `window: daily` bucket (the free-neurons allowance) with no description:
 
 - remaining fraction: `max(0, 1 - used/capacity)` from today's analytics
   `sum.totalNeurons` against the configured daily free neurons;
@@ -407,7 +407,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.2.2_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.2.3_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.
