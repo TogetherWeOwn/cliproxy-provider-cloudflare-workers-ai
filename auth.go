@@ -18,7 +18,7 @@ import (
 const (
 	provider            = "cloudflare-workers-ai"
 	displayName         = "Cloudflare Workers AI"
-	version             = "0.2.3"
+	version             = "0.2.4"
 	modelPrefix         = "cloudflare/"
 	upstreamBase        = "https://api.cloudflare.com"
 	defaultDailyNeurons = 10000.0
@@ -124,10 +124,14 @@ func numberField(fields map[string]any, name string, fallback float64) (float64,
 func validToken(token string) bool { return token != "" && !strings.ContainsAny(token, "\r\n\x00") }
 
 // ownership is the kit filename-ownership duplicate guard: it retains only
-// identity digests, so a watcher can reparse one filename. Host parses commit
-// ownership (deleting/renaming an auth file still requires a plugin lifecycle
-// reset), while login-validation parses are provisional and only reserve the
-// digest until the login session expires, so an abandoned login releases it.
+// identity digests, so a watcher can reparse one filename.
+//
+// The provider is API-key only: it registers no AuthProvider, so the
+// management UI shows no login card and auth files load through the host's
+// generic file path. ParseAuth stays as the documented auth-file
+// validation (account_id shape, tunables, duplicate-key guard) beside the
+// JSON shape in the README; re-register it as the plugin AuthProvider to
+// restore upload-time validation.
 type authProvider struct {
 	kit.APIKeyAuth
 	guard     *freeGuard
@@ -135,14 +139,8 @@ type authProvider struct {
 }
 
 // guard learns the host's global proxy-url from each parse/refresh request.
-func newAuthProvider(guard *freeGuard) (*authProvider, error) {
-	return newAuthProviderWithLoginTTL(guard, 0)
-}
-
-// loginTTL zero keeps the kit's default login session TTL; tests pass a short
-// TTL so an abandoned login's ownership reservation lapses quickly.
-func newAuthProviderWithLoginTTL(guard *freeGuard, loginTTL time.Duration) (*authProvider, error) {
-	p := &authProvider{guard: guard, APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
+func newAuthProvider(guard *freeGuard) *authProvider {
+	return &authProvider{guard: guard, APIKeyAuth: kit.APIKeyAuth{Provider: provider, Validate: func(fields map[string]any) error {
 		if _, ok := fields["id"]; ok {
 			return invalidAuth()
 		}
@@ -153,26 +151,6 @@ func newAuthProviderWithLoginTTL(guard *freeGuard, loginTTL time.Duration) (*aut
 		}
 		return err
 	}}}
-	// Only the two string fields are login fields: the login page submits every
-	// answer as a JSON string, while credentialsFields (numberField, the
-	// stay_within_free bool) requires numbers/booleans for the tunables, so
-	// those stay file-managed. Parse is the full ParseAuth pipeline.
-	// Identity here is account+token (see the duplicate guard in ParseAuth),
-	// so account_id must join the key in the kit's deterministic login file
-	// name: key-only derivation made the same token under two accounts mint
-	// one file name and the second login overwrote the first account's
-	// ownership entry. credentialsFields canonicalizes the account to
-	// lowercase, so the filename fold matches it: mixed-case spellings of
-	// one account then mint one file name instead of tripping the guard.
-	login, err := kit.NewAPIKeyLogin(kit.APIKeyLoginConfig{Provider: provider, Parse: p.ParseAuth, SessionTTL: loginTTL, Fields: []kit.APIKeyLoginField{
-		{Name: "account_id", Label: "Account ID", Description: "Cloudflare account ID: 32 lowercase hex characters.", Required: true, LowercaseForFilename: true},
-		{Name: "analytics_api_key", Label: "Analytics API key", Description: "Optional separate token for analytics reads. Leave blank to reuse the API token.", Required: false, Secret: true},
-	}, FilenameFields: []string{"account_id"}})
-	if err != nil {
-		return nil, err
-	}
-	p.APIKeyAuth.Login = login
-	return p, nil
 }
 func (p *authProvider) ParseAuth(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 	p.guard.observeHost(req.Host)

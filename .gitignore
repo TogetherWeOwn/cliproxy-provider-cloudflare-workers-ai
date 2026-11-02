@@ -5,3 +5,4 @@ dist/
 .env*
 auth/
 __pycache__/
+cliproxy-provider-cloudflare-workers-ai

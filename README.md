@@ -24,8 +24,13 @@ readiness. See [migration](docs/MIGRATION.md), [sources](docs/SOURCES.md) and
 
 ## Auth file
 
-Create one private JSON file per account/token pair in CLIProxy's auth directory,
-mode `0600`. Never save actual credentials in this repository.
+The provider is API-key only: there is no login card in the management UI.
+Upload one private JSON file per account/token pair through the management
+UI's auth-file upload (the same path built-in API-key providers use), or place
+the file directly in CLIProxy's auth directory, mode `0600`. Never save actual
+credentials in this repository. `account_id` is required: it scopes inference,
+discovery and quota to the account, so it cannot be filled in later by a login
+form.
 
 ```json
 {
@@ -78,34 +83,22 @@ mode `0600`. Never save actual credentials in this repository.
   remain host-owned. Fixed model namespace `cloudflare/`; auth `prefix` does
   not replace it.
 
-Auth ID is `cloudflare-workers-ai:` plus the first 12 hex characters of SHA-256
-of `normalized_account_id + NUL + trimmed_api_key`. User-supplied IDs are rejected.
-The analytics token and card-capacity changes do not alter identity. An identical
-account/token pair in two files is rejected; reparsing one filename is safe.
-Changing that file's token releases its old identity. For renames/deletions,
-clear the plugin's in-memory ownership through a supported plugin lifecycle
-before reusing an identity in another filename.
+The auth ID is the file's relative path under the auth directory; a
+user-supplied `id` field is stored but ignored. Every file loads as its own
+auth, so use one file per account/token pair — an identical pair in two files
+loads twice instead of being rejected. Renaming, editing or deleting a file
+takes effect when the host rescans the auth directory; no plugin restart is
+needed. Uploaded files are not validated against the shape above at upload
+time (a malformed `account_id` or out-of-range tunable loads, then fails at
+request time); the unit-tested ParseAuth in `auth.go` documents the intended
+shape. The numeric tunables (`daily_free_neurons`, `safety_margin_neurons`,
+`cold_start_hold_seconds`) and `stay_within_free` are file-managed: edit the
+stored auth file to change them.
 
 Different API tokens on **one account share the same daily allocation**. Their
 cards report the same account-wide consumption; never add these capacities as
 independent entitlements. Refresh preserves the record and makes no upstream
 call.
-
-## Management-UI login
-
-The management UI's login card serves a kit login page that displays a shell
-block. Paste it into `bash` or `zsh`; the terminal then prompts for the API
-token, the Cloudflare account ID and the optional separate analytics token, then
-submits them over an authenticated management POST (the API token travels in
-the POST body and the management key in the `Authorization` header, never in
-URLs, logs or process arguments). The submission runs the
-same ParseAuth validation and duplicate-auth guard as an uploaded auth file, so
-submitting the same account and token twice is idempotent. On a remote host, set
-`CLIPROXY_BASE` to an `https://` base so secrets are encrypted in transit.
-
-The numeric tunables (`daily_free_neurons`, `safety_margin_neurons`,
-`cold_start_hold_seconds`) and `stay_within_free` are not on the login page and
-must be added by editing the stored auth file afterwards.
 
 ## Models and execution
 
@@ -407,7 +400,7 @@ bash scripts/package-release.sh <output-dir>
 ```
 
 The package script refuses libraries needing glibc newer than **2.34**, checked
-with `objdump -T`. It creates `cloudflare-workers-ai_0.2.3_linux_amd64.zip`
+with `objdump -T`. It creates `cloudflare-workers-ai_0.2.4_linux_amd64.zip`
 containing `cloudflare-workers-ai.so` and `LICENSE`, plus archive `checksums.txt`.
 It never publishes or touches a running host. Publish both files with a matching
 release; the schema-v1 `registry.json` uses native `github-release` installation.

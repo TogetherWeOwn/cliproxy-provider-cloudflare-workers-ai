@@ -63,6 +63,27 @@ func authJSON(key string) []byte {
 	return raw
 }
 
+// genericFileAuth mirrors the host's generic file path for an API-key-only
+// plugin: the plugin registers no AuthProvider, so the host parse
+// is unhandled and the file payload converts the way synthesizeFileAuths
+// would (provider from type, ID from the relative path, metadata from the
+// file JSON).
+func genericFileAuth(t *testing.T, ctx context.Context, host *pluginhost.Host, dir, fileName string, rawJSON []byte) *coreauth.Auth {
+	t.Helper()
+	if _, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: fileName, RawJSON: rawJSON}); err != nil || handled {
+		t.Fatalf("plugin auth unexpectedly handled %v %v", handled, err)
+	}
+	var metadata map[string]any
+	if json.Unmarshal(rawJSON, &metadata) != nil {
+		t.Fatal("invalid fixture JSON")
+	}
+	auth := host.AuthDataToCoreAuth(pluginapi.AuthData{Provider: provider, FileName: fileName, Label: provider, StorageJSON: rawJSON, Metadata: metadata}, filepath.Join(dir, fileName), fileName)
+	if auth == nil {
+		t.Fatalf("generic file auth %s did not convert", fileName)
+	}
+	return auth
+}
+
 // fixture reads mock directives from the first message. They travel in the
 // content because the free-only guard forwards only allowlisted fields.
 type fixture struct {
@@ -218,22 +239,22 @@ func TestRealHostLoader(t *testing.T) {
 	defer cancel()
 	ctx = logging.WithResponseHeadersHolder(ctx)
 	host.ApplyConfig(ctx, cfg)
-	if !host.PluginLoaded(provider) || !host.PluginRegistered(provider) || !host.HasAuthProvider(provider) || !host.HasQuotaProvider(provider) {
+	// API-key only: the plugin registers no AuthProvider, so the
+	// management UI shows no login card.
+	if !host.PluginLoaded(provider) || !host.PluginRegistered(provider) || host.HasAuthProvider(provider) || !host.HasQuotaProvider(provider) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.2.3" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.2.4" {
 		t.Fatalf("metadata %+v", info)
 	}
-	auth, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "example.json", RawJSON: authJSON("example-key")})
-	if err != nil || !handled || auth == nil {
-		t.Fatalf("auth %v %v", handled, err)
-	}
-	if _, _, err = host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "duplicate.json", RawJSON: authJSON("example-key")}); err == nil {
-		t.Fatal("duplicate accepted")
-	}
+	fileRaw := authJSON("example-key")
+	auth := genericFileAuth(t, ctx, host, cfg.AuthDir, "example.json", fileRaw)
 	file := filepath.Join(cfg.AuthDir, "example.json")
-	if err = auth.Storage.SaveTokenToFile(file); err != nil {
+	if err := os.WriteFile(file, fileRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.Storage.SaveTokenToFile(file); err != nil {
 		t.Fatal(err)
 	}
 	saved, err := os.ReadFile(file)
@@ -330,10 +351,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 	}
 	t.Run("daily exhaustion rotates only failed auth until UTC reset", func(t *testing.T) {
-		second, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "second.json", RawJSON: authJSON("second-key")})
-		if err != nil || !handled || second == nil {
-			t.Fatal(err)
-		}
+		second := genericFileAuth(t, ctx, host, cfg.AuthDir, "second.json", authJSON("second-key"))
 		mgr := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
 		mgr.SetRetryConfig(0, 0, 2)
 		mgr.RegisterExecutor(ex)
@@ -369,10 +387,7 @@ func TestRealHostLoader(t *testing.T) {
 	})
 	t.Run("free-only guard refuses before dispatch until UTC reset", func(t *testing.T) {
 		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": exhausted, "api_key": "example-key", "analytics_api_key": "analytics-key", "cold_start_hold_seconds": 0})
-		spent, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "exhausted.json", RawJSON: raw})
-		if err != nil || !handled || spent == nil {
-			t.Fatal(err)
-		}
+		spent := genericFileAuth(t, ctx, host, cfg.AuthDir, "exhausted.json", raw)
 		mgr := coreauth.NewManager(nil, nil, nil)
 		mgr.SetRetryConfig(0, 0, 1)
 		mgr.RegisterExecutor(ex)
@@ -398,10 +413,7 @@ func TestRealHostLoader(t *testing.T) {
 	})
 	t.Run("tally-only guard refusal cools down minutes, not until UTC reset", func(t *testing.T) {
 		raw, _ := json.Marshal(map[string]any{"type": provider, "account_id": busy, "api_key": "example-key", "analytics_api_key": "analytics-key", "cold_start_hold_seconds": 0})
-		pending, handled, err := host.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: provider, FileName: "busy.json", RawJSON: raw})
-		if err != nil || !handled || pending == nil {
-			t.Fatal(err)
-		}
+		pending := genericFileAuth(t, ctx, host, cfg.AuthDir, "busy.json", raw)
 		mgr := coreauth.NewManager(nil, nil, nil)
 		mgr.SetRetryConfig(0, 0, 1)
 		mgr.RegisterExecutor(ex)
@@ -463,7 +475,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.2.3" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.2.4" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }
