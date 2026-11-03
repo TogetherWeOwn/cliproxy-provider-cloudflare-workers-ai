@@ -47,6 +47,11 @@ func (cat catalog) ModelsForAuth(ctx context.Context, r pluginapi.AuthModelReque
 	if err != nil {
 		return pluginapi.ModelResponse{}, err
 	}
+	// The host no longer calls ParseAuth for file-loaded auths, so fold this
+	// auth's account-wide limits into the shared ledger here: the host runs
+	// discovery for every loaded auth, which restores fold-at-load without a
+	// login card. Admission still enforces the ledger per request.
+	cat.guard.observeAuth(c)
 	if r.HTTPClient == nil {
 		return pluginapi.ModelResponse{}, &pluginabi.Error{Code: "host_unavailable", Message: "model discovery requires the host HTTP client", HTTPStatus: 503}
 	}
