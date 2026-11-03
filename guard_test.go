@@ -634,3 +634,30 @@ func TestAnalyticsClientReadsHTTP2TLSServer(t *testing.T) {
 		t.Fatalf("used %v err %v", used, err)
 	}
 }
+
+// Discovery runs for every loaded auth, so it folds each auth's account-wide
+// limits without a login-time parse: an idle strict auth still constrains the
+// account before a permissive sibling is admitted.
+func TestModelsForAuthFoldsIdleAuthSettings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
+			_, _ = io.WriteString(w, `{"success":true,"errors":[],"result":[],"result_info":{"page":1,"total_pages":1}}`)
+			return
+		}
+		t.Errorf("unexpected discovery request %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+	g := testGuard(server)
+	c := newCatalog(g)
+	metadata := map[string]any{"daily_free_neurons": float64(2000), "safety_margin_neurons": float64(100)}
+	req := pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), Metadata: metadata, HTTPClient: mockHostClient{server}}
+	if _, err := c.ModelsForAuth(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	l := g.accounts[testAccount]
+	if l == nil || l.capacity != 2000 || l.margin != 100 {
+		t.Fatalf("idle auth settings not folded at discovery: %+v", l)
+	}
+}

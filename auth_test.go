@@ -56,7 +56,7 @@ func TestAuthStableAccountAndTokenIdentity(t *testing.T) {
 	if _, err = p.StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{}); err == nil {
 		t.Fatal("login started for an API-key-only provider")
 	}
-	if polled, err := p.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{}); err == nil && polled.Status == pluginapi.AuthLoginStatusSuccess {
+	if polled, err := p.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{}); err == nil {
 		t.Fatal("polled an unknown login state", polled)
 	}
 }

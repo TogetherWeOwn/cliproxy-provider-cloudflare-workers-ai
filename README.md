@@ -41,7 +41,6 @@ form.
   "daily_free_neurons": 10000,
   "stay_within_free": true,
   "safety_margin_neurons": 500,
-  "label": "<account-label>",
   "weight": 1,
   "priority": 0,
   "disabled": false
@@ -61,7 +60,8 @@ form.
   the official pricing page. This sets the card's capacity and the hard stop's
   ceiling. It does not change the upstream allowance. Do not increase it to
   invent free usage. When several auths share one account, the hard stop uses
-  the **lowest** value any of them has carried since the plugin loaded.
+  the **lowest** value any of them has carried: every loaded auth folds its
+  settings at discovery, and every admission folds the requesting auth's.
 - `stay_within_free`: optional boolean; default **true**. Turns on the free-only
   hard stop. Set it to `false` only for an account where paid usage is
   approved; the plugin then behaves like v0.1.1 (no usage check before
@@ -76,11 +76,13 @@ form.
   This many neurons are kept unused below `daily_free_neurons`. The margin
   absorbs estimate errors, sampled analytics and other consumers. A margin at or
   above the capacity refuses every request. When several auths share one
-  account, the hard stop uses the **highest** margin any of them has carried
-  since the plugin loaded. Raising the capacity or lowering the margin of a
+  account, the hard stop uses the **highest** margin any of them has carried,
+  folded at discovery and admission alike. Raising the capacity or lowering the margin of a
   shared account takes effect after a plugin reload.
-- Native `prefix`, `proxy_url`, weights, priorities, label and disabled fields
-  remain host-owned. Fixed model namespace `cloudflare/`; auth `prefix` does
+- Native `prefix`, `proxy_url`, weights, priorities and disabled fields
+  remain host-owned. The management UI derives the display label from the file
+  itself; a file-level `label` is ignored on the generic file path.
+  Fixed model namespace `cloudflare/`; auth `prefix` does
   not replace it.
 
 The auth ID is the file's relative path under the auth directory; a
