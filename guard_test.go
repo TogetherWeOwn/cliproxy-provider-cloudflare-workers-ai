@@ -241,7 +241,7 @@ func TestGuardFailsClosedOnFailedOrStaleAnalytics(t *testing.T) {
 		f.status.Store(status)
 		server := f.serve(t)
 		e := wantCode(t, guardAt(&now, server).admit(context.Background(), freeCredentials(t, nil), 1), "quota_unverified")
-		if e.HTTPStatus != 503 || e.RetryAfterSeconds != 60 {
+		if e.HTTPStatus != 503 || !e.Retryable || e.RetryAfterSeconds != 60 || !strings.HasPrefix(e.Message, "quota_unverified:") {
 			t.Fatalf("unverified error %+v", e)
 		}
 	}

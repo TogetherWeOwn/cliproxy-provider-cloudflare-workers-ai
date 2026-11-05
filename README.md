@@ -197,7 +197,11 @@ field/filter combination in a static Workers AI example. **Do not mistake mock/s
 successful live GraphQL canary.** See the explicit evidence boundary in
 [Sources](docs/SOURCES.md).
 
-One group contains one `window: daily` bucket (the free-neurons allowance) with no description:
+The `Daily free allocation (configured)` group contains one `window: daily`
+bucket (the free-neurons allowance) with no description. The group label makes
+clear that capacity is operator-configured, not fetched from a per-account
+allocation endpoint, while preserving the canonical daily bar and overage-only
+summary:
 
 - remaining fraction: `max(0, 1 - used/capacity)` from today's analytics
   `sum.totalNeurons` against the configured daily free neurons;
@@ -332,6 +336,15 @@ the request. A refusal caused only by recent admissions still in the tally is a
 auth/model down for minutes, not for the rest of the day. The plugin never
 opens the gate just because analytics might be stale. Set
 `stay_within_free: false` only where paid usage has been approved.
+
+The `quota_unverified` refusal is shaped so a connector can tell it apart from
+a downstream 429: HTTP 503 (never 429), a 60-second retry hint, and a
+`quota_unverified:` message prefix. The prefix matters because the host renders
+refusals to clients as `{"error": message}` and the plugin error code never
+reaches them; match on the 503 status plus the prefix, since "refused to avoid
+paid usage" alone is shared with `quota_exhausted`. The refusal cools the model
+down briefly and never marks quota exhausted, so a fixable analytics-permission
+problem does not sideline the account until the UTC reset.
 
 **Overshoot bound.** Two assumptions:
 
