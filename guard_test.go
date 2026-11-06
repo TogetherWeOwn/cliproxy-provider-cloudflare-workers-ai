@@ -241,7 +241,7 @@ func TestGuardFailsClosedOnFailedOrStaleAnalytics(t *testing.T) {
 		f.status.Store(status)
 		server := f.serve(t)
 		e := wantCode(t, guardAt(&now, server).admit(context.Background(), freeCredentials(t, nil), 1), "quota_unverified")
-		if e.HTTPStatus != 503 || e.RetryAfterSeconds != 60 {
+		if e.HTTPStatus != 503 || !e.Retryable || e.RetryAfterSeconds != 60 || !strings.HasPrefix(e.Message, "quota_unverified:") {
 			t.Fatalf("unverified error %+v", e)
 		}
 	}
@@ -271,7 +271,10 @@ func TestGuardFailsClosedOnFailedOrStaleAnalytics(t *testing.T) {
 		t.Fatalf("recent reading rejected: %v", err)
 	}
 	now = now.Add(time.Second)
-	wantCode(t, g.admit(context.Background(), c, 1), "quota_unverified")
+	e := wantCode(t, g.admit(context.Background(), c, 1), "quota_unverified")
+	if e.HTTPStatus != 503 || !e.Retryable || e.RetryAfterSeconds != 60 || !strings.HasPrefix(e.Message, "quota_unverified:") {
+		t.Fatalf("stale reading unverified error %+v", e)
+	}
 	f.status.Store(0)
 	if err := g.admit(context.Background(), c, 1); err != nil {
 		t.Fatalf("did not recover: %v", err)

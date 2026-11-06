@@ -84,6 +84,9 @@ func TestDailyQuotaUsesAccountWideUTCNeuronsAndSeparateAnalyticsToken(t *testing
 		if err != nil || len(out.Groups) != 1 || len(out.Groups[0].Buckets) != 1 {
 			t.Fatalf("quota %v %v", out, err)
 		}
+		if out.Groups[0].DisplayName != "Daily free allocation (configured)" {
+			t.Fatalf("configured capacity label lost: %+v", out.Groups[0])
+		}
 		b := out.Groups[0].Buckets[0]
 		if b.Window != "daily" || b.Description != "" || b.RemainingFraction != 0 || b.ResetTime != "2030-01-02T00:00:00Z" {
 			t.Fatalf("bad bucket %+v", b)

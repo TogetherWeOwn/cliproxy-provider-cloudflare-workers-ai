@@ -68,7 +68,7 @@ func normalizeQuota(used, capacity float64, now time.Time) (pluginapi.QuotaFetch
 		return pluginapi.QuotaFetchResponse{}, analyticsError("analytics_invalid_data", "invalid neuron usage or daily capacity")
 	}
 	return pluginapi.QuotaFetchResponse{
-		Groups: []pluginapi.QuotaGroup{{DisplayName: "Cloudflare Workers AI", Buckets: []pluginapi.QuotaBucket{{
+		Groups: []pluginapi.QuotaGroup{{DisplayName: "Daily free allocation (configured)", Buckets: []pluginapi.QuotaBucket{{
 			Window: "daily", RemainingFraction: math.Max(0, 1-used/capacity), ResetTime: nextReset(now).Format(time.RFC3339),
 		}}}},
 		Summary: aboveFree(used, capacity),
