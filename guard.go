@@ -124,8 +124,8 @@ func requestTooLargeError() *pluginabi.Error {
 }
 
 // The message carries the code token because the host renders pre-dispatch
-// refusals to HTTP clients as {"error": message}: the Code field never
-// reaches them, so a connector classifying on status plus body needs the
+// refusals to HTTP clients as {"error": {"message": ...}}: the Code field
+// never reaches them, so a connector classifying on status plus body needs the
 // label in the body to tell this guard refusal apart from a downstream 429
 // or 5xx. Keep the token as a prefix; log lines are often truncated on the
 // right, and "refused to avoid paid usage" alone is shared with
