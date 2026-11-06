@@ -128,7 +128,7 @@ func fixtureOf(body map[string]any) (fx fixture) {
 // Real v8.0.49 dlopen, C-ABI registration, RPC dispatch, auth persistence and
 // executor adapters. The only provider network target is an httptest server.
 func TestRealHostLoader(t *testing.T) {
-	var polls atomic.Int32
+	var polls, revokedPolls atomic.Int32
 	gate := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -137,19 +137,22 @@ func TestRealHostLoader(t *testing.T) {
 			if r.Method != "POST" {
 				t.Error("bad analytics request")
 			}
-			if r.Header.Get("Authorization") != "Bearer analytics-key" {
-				// Revoked or missing Analytics Read permission: usage cannot
-				// be checked. The guard must refuse inference as
-				// quota_unverified, never as a 429.
-				w.WriteHeader(http.StatusForbidden)
-				return
-			}
 			var wire struct {
 				Query     string
 				Variables map[string]string
 			}
-			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account && wire.Variables["account"] != exhausted && wire.Variables["account"] != busy || !strings.Contains(wire.Query, "totalNeurons") {
+			if json.NewDecoder(r.Body).Decode(&wire) != nil || wire.Variables["account"] != account && wire.Variables["account"] != exhausted && wire.Variables["account"] != busy && wire.Variables["account"] != unverified || !strings.Contains(wire.Query, "totalNeurons") {
 				t.Error("bad GraphQL query")
+			}
+			if r.Header.Get("Authorization") != "Bearer analytics-key" {
+				if r.Header.Get("Authorization") != "Bearer revoked-key" || wire.Variables["account"] != unverified {
+					t.Error("unexpected revoked analytics request")
+				}
+				// Revoked Analytics Read permission: record the actual 403
+				// path so an earlier failure cannot satisfy the refusal tests.
+				w.WriteHeader(http.StatusForbidden)
+				revokedPolls.Add(1)
+				return
 			}
 			used := "7500"
 			switch wire.Variables["account"] {
@@ -486,7 +489,11 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		registry.GetGlobalRegistry().RegisterClient(blind.ID, blind.Provider, []*registry.ModelInfo{{ID: model}})
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(blind.ID) })
+		before := revokedPolls.Load()
 		_, err = mgr.Execute(ctx, []string{provider}, coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hello"}]}`)}, opts)
+		if revokedPolls.Load() <= before {
+			t.Fatal("guard refusal did not reach the revoked-account analytics 403")
+		}
 		e, ok := err.(interface{ StatusCode() int })
 		if !ok || e.StatusCode() != http.StatusServiceUnavailable {
 			t.Fatalf("guard refusal %T %v", err, err)
@@ -528,8 +535,12 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		// The quota card fails closed too, so quota sync never reports this
 		// account as healthy while inference refuses.
+		before = revokedPolls.Load()
 		if _, _, err = host.FetchQuota(ctx, pluginapi.QuotaFetchRequest{AuthID: quotaAuthID, Provider: provider, StorageJSON: blindSaved}); err == nil {
 			t.Fatal("quota fetch succeeded despite revoked analytics permission")
+		}
+		if revokedPolls.Load() <= before {
+			t.Fatal("quota fetch did not reach the revoked-account analytics 403")
 		}
 	})
 	t.Run("pinned host transient 429 marker limitation", func(t *testing.T) {
