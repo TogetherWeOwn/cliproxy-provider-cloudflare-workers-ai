@@ -339,10 +339,11 @@ opens the gate just because analytics might be stale. Set
 
 The `quota_unverified` refusal is shaped so a connector can tell it apart from
 a downstream 429: HTTP 503 (never 429), a 60-second retry hint, and a
-`quota_unverified:` message prefix. The prefix matters because the host renders
-refusals to clients as `{"error": message}` and the plugin error code never
-reaches them; match on the 503 status plus the prefix, since "refused to avoid
-paid usage" alone is shared with `quota_exhausted`. The refusal cools the model
+`quota_unverified:` message prefix. For non-streaming OpenAI chat completions,
+the host puts this message in `error.message` inside the JSON `error` object;
+the plugin error code is not preserved as a client-facing code. Match on the
+503 status plus the `error.message` prefix, since "refused to avoid paid usage"
+alone is shared with `quota_exhausted`. The refusal cools the model
 down briefly and never marks quota exhausted, so a fixable analytics-permission
 problem does not sideline the account until the UTC reset.
 

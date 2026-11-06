@@ -20,11 +20,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -493,8 +496,28 @@ func TestRealHostLoader(t *testing.T) {
 		if hint, ok := err.(interface{ RetryAfter() *time.Duration }); !ok || hint.RetryAfter() == nil || *hint.RetryAfter() <= 0 || *hint.RetryAfter() > 60*time.Second {
 			t.Fatalf("guard refusal retry hint %v", err)
 		}
-		if msg := err.Error(); !strings.Contains(msg, "quota_unverified") || !strings.Contains(msg, "cannot be verified") {
+		if msg := err.Error(); !strings.HasPrefix(msg, "quota_unverified:") || !strings.Contains(msg, "cannot be verified") {
 			t.Fatalf("guard refusal lost its label %q", msg)
+		}
+		// Render the real manager error through the same response writer used
+		// by non-streaming OpenAI chat completions, not a local JSON stand-in.
+		recorder := httptest.NewRecorder()
+		client, _ := gin.CreateTestContext(recorder)
+		client.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		handlers.NewBaseAPIHandlers(nil, mgr).WriteErrorResponse(client, &interfaces.ErrorMessage{StatusCode: e.StatusCode(), Error: err})
+		var body struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("client refusal status %d: %s", recorder.Code, recorder.Body.String())
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatalf("client refusal body %q: %v", recorder.Body.String(), err)
+		}
+		if msg := body.Error.Message; !strings.HasPrefix(msg, "quota_unverified:") || !strings.Contains(msg, "cannot be verified") {
+			t.Fatalf("client refusal lost its label %q", msg)
 		}
 		// A 503 guard refusal cools the model down briefly; unlike a 429 it
 		// must never mark quota exhausted (that state waits for the UTC reset
