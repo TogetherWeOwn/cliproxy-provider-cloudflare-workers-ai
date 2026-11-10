@@ -20,8 +20,15 @@ import (
 // paginated models/search Fetch and the per-account probe Validate hook.
 // Fetch and Validate run foreground-only inside ModelsForAuth with the
 // request-scoped host client.
+//
+// Two kit catalogs are kept apart on purpose: the fetch catalog carries no
+// kit Static list, so a failed fetch with no durable last-good surfaces an
+// error to ModelsForAuth, which then validates the static fallback per
+// account itself (the pre-kit behavior). The static catalog serves
+// RegisterModels/StaticModels, which have no auth to validate against.
 type catalog struct {
 	inner  *providerkit.ModelCatalog
+	static *providerkit.ModelCatalog
 	guard  *freeGuard
 	probes chan struct{}
 	cache  *verdictCache
@@ -36,17 +43,21 @@ func newCatalog(guard *freeGuard) catalog {
 // ModelCatalogConfig.TTL note).
 func newCatalogWithTTL(guard *freeGuard, ttl time.Duration) catalog {
 	c := catalog{guard: guard, probes: make(chan struct{}, probeConcurrency), cache: newVerdictCache()}
-	cfg := providerkit.ModelCatalogConfig{
+	fetchCfg := providerkit.ModelCatalogConfig{
 		Namespace: "cloudflare",
-		Static:    fallbackModels(),
 		Fetch:     c.fetch,
 		Validate:  c.validateModels,
 	}
-	if ttl > 0 {
-		c.inner = providerkit.NewModelCatalogWithTTL(cfg, ttl)
-	} else {
-		c.inner = providerkit.NewModelCatalog(cfg)
+	staticCfg := providerkit.ModelCatalogConfig{
+		Namespace: "cloudflare",
+		Static:    fallbackModels(),
 	}
+	if ttl > 0 {
+		c.inner = providerkit.NewModelCatalogWithTTL(fetchCfg, ttl)
+	} else {
+		c.inner = providerkit.NewModelCatalog(fetchCfg)
+	}
+	c.static = providerkit.NewModelCatalog(staticCfg)
 	return c
 }
 
@@ -70,7 +81,7 @@ func fallbackModels() []pluginapi.ModelInfo {
 // catalogs under the provider id ("cloudflare-workers-ai"), so the wrapper
 // rewrites it; the old hand-rolled code already returned the provider id.
 func (c catalog) RegisterModels(ctx context.Context, req pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
-	resp, err := c.inner.RegisterModels(ctx, req)
+	resp, err := c.static.RegisterModels(ctx, req)
 	if err != nil {
 		return pluginapi.ModelRegistrationResponse{}, err
 	}
@@ -80,7 +91,7 @@ func (c catalog) RegisterModels(ctx context.Context, req pluginapi.ModelRegistra
 
 func (c catalog) StaticModels(ctx context.Context, req pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
 	c.guard.observeHost(req.Host)
-	resp, err := c.inner.StaticModels(ctx, req)
+	resp, err := c.static.StaticModels(ctx, req)
 	if err != nil {
 		return pluginapi.ModelResponse{}, err
 	}
@@ -89,6 +100,9 @@ func (c catalog) StaticModels(ctx context.Context, req pluginapi.StaticModelRequ
 }
 
 func (c catalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return pluginapi.ModelResponse{}, err
+	}
 	c.guard.observeHost(req.Host)
 	// Failing on invalid credentials here (rather than serving the static
 	// fallback) preserves the plugin's contract: a broken auth is an error,
@@ -107,15 +121,44 @@ func (c catalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReque
 		return pluginapi.ModelResponse{}, &pluginabi.Error{Code: "host_unavailable", Message: "model discovery requires the host HTTP client", HTTPStatus: 503}
 	}
 	// Every invocation fetches fresh through the kit catalog (no TTL skip);
-	// a transient failure serves durable last-good, then the static list.
+	// a transient failure serves the kit's durable last-good internally.
+	// One deadline spans fetch, validation and any fallback validation
+	// below: the kit's ModelsFetchTimeout, never extended.
 	// Provider is rewritten to the provider id for the same registry reason
 	// as in RegisterModels above.
-	resp, err := c.inner.ModelsForAuth(ctx, req)
+	dctx, cancel := context.WithTimeout(ctx, providerkit.ModelsFetchTimeout)
+	defer cancel()
+	resp, err := c.inner.ModelsForAuth(dctx, req)
 	if err != nil {
-		return pluginapi.ModelResponse{}, err
+		// An error here means no durable last-good exists for this
+		// credential generation (the kit serves last-good internally
+		// otherwise), so the static fallback is next, as before the kit
+		// migration. A cancelled/deadline-expired call cannot probe;
+		// it serves the static list, matching the kit's former
+		// cancellation behavior. A live call validates the fallback
+		// per account, so an account denied a static model never
+		// receives it in its authenticated catalog.
+		if dctx.Err() != nil {
+			return pluginapi.ModelResponse{Provider: provider, Models: namespacedFallback()}, nil
+		}
+		models, verr := c.validate(dctx, req.HTTPClient, cred, namespacedFallback())
+		if verr != nil {
+			return pluginapi.ModelResponse{}, verr
+		}
+		resp = pluginapi.ModelResponse{Models: models}
 	}
 	resp.Provider = provider
 	return resp, nil
+}
+
+// namespacedFallback is the static fallback list in the served namespace,
+// in the pre-kit shape validate accepts (upstream id behind the prefix).
+func namespacedFallback() []pluginapi.ModelInfo {
+	out := fallbackModels()
+	for i := range out {
+		out[i].ID = modelPrefix + out[i].ID
+	}
+	return out
 }
 
 // fetch is the kit FetchModelsFunc: the plugin-owned paginated
@@ -173,11 +216,24 @@ func discoverModels(ctx context.Context, client pluginapi.HostHTTPClient, c cred
 		}
 		if wire.Info.TotalPages > 0 {
 			if page >= wire.Info.TotalPages {
-				return models, nil
+				return markContributorBases(models, seen), nil
 			}
 		} else if len(*wire.Result) < perPage {
-			return models, nil
+			return markContributorBases(models, seen), nil
 		}
 	}
 	return nil, &pluginabi.Error{Code: "invalid_models", Message: "Workers AI catalog exceeds discovery page bound", HTTPStatus: 502}
+}
+
+// markContributorBases tags a "-contributor" entry whose base id is also in
+// the search results. The kit drops such a base before Validate runs; the
+// tag lets Validate resurrect the base when the preferred contributor is
+// ineligible (see validate). Validate strips the tag before serving.
+func markContributorBases(models []pluginapi.ModelInfo, seen map[string]bool) []pluginapi.ModelInfo {
+	for i := range models {
+		if base, ok := strings.CutSuffix(models[i].ID, "-contributor"); ok && seen[base] {
+			models[i].Type = contributorBasePresent
+		}
+	}
+	return models
 }

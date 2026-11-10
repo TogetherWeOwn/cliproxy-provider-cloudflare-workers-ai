@@ -642,13 +642,20 @@ func TestAnalyticsClientReadsHTTP2TLSServer(t *testing.T) {
 // limits without a login-time parse: an idle strict auth still constrains the
 // account before a permissive sibling is admitted.
 func TestModelsForAuthFoldsIdleAuthSettings(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// An empty search result is a failed fetch, so ModelsForAuth validates
+	// the static fallback with probes; answer them (and the guard's
+	// analytics poll via withAnalytics) while asserting the fold.
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
 			_, _ = io.WriteString(w, `{"success":true,"errors":[],"result":[],"result_info":{"page":1,"total_pages":1}}`)
 			return
 		}
-		t.Errorf("unexpected discovery request %s %s", r.Method, r.URL.Path)
-	}))
+		if !strings.HasSuffix(r.URL.Path, "/ai/v1/chat/completions") {
+			t.Errorf("unexpected discovery request %s %s", r.Method, r.URL.Path)
+			return
+		}
+		_, _ = io.WriteString(w, `{"object":"chat.completion","choices":[]}`)
+	})))
 	defer server.Close()
 	g := testGuard(server)
 	c := newCatalog(g)

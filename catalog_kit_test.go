@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,11 +21,14 @@ import (
 // assert only plugin-observable outcomes.
 
 // searchCatalogFixture serves a swappable models/search response and
-// answers validation probes with 200.
+// answers validation probes with 200 (or the per-model status in
+// probeStatus, set before serve).
 type searchCatalogFixture struct {
-	body  atomic.Value // string search body for the ok mode
-	mode  atomic.Int32 // 0 ok, 1 upstream failure, 2 malformed
-	calls atomic.Int32
+	body        atomic.Value // string search body for the ok mode
+	mode        atomic.Int32 // 0 ok, 1 upstream failure, 2 malformed
+	calls       atomic.Int32
+	probeStatus map[string]int // upstream model id -> probe HTTP status
+	delay       time.Duration  // probe latency, for deadline fixtures
 }
 
 func (f *searchCatalogFixture) setBody(b string) { f.body.Store(b) }
@@ -47,7 +51,22 @@ func (f *searchCatalogFixture) serve(t *testing.T) *httptest.Server {
 			io.WriteString(w, b)
 			return
 		}
-		io.Copy(io.Discard, r.Body)
+		raw, _ := io.ReadAll(r.Body)
+		var probed struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(raw, &probed)
+		if f.delay > 0 {
+			select {
+			case <-time.After(f.delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if status, ok := f.probeStatus[probed.Model]; ok {
+			w.WriteHeader(status)
+			return
+		}
 		io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
 	})))
 	t.Cleanup(server.Close)
@@ -125,7 +144,8 @@ func TestCatalogLastGoodSurvivesFreshnessExpiry(t *testing.T) {
 
 // A different credential generation never inherits another generation's
 // last-good: with no history of its own, a failing fetch gets the static
-// list.
+// fallback (validated per account; the fixture probes 200, so the full
+// static list serves).
 func TestCatalogCredentialGenerationIsolation(t *testing.T) {
 	f := &searchCatalogFixture{}
 	f.setBody(searchBody("@cf/openai/gpt-oss-20b"))
@@ -234,5 +254,71 @@ func TestCatalogBlockingFetchDeadline(t *testing.T) {
 	defer cancel()
 	if out, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, catalogRequest(server, probeOnly)); err != nil || ids(out.Models) != staticServed {
 		t.Fatalf("blocked fetch served %s %v, want static", ids(out.Models), err)
+	}
+}
+
+// The static fallback is validated per account: a fresh credential
+// generation with no last-good, a failed search, and an account the
+// upstream denies one static model must not receive that model.
+func TestCatalogStaticFallbackIsValidatedPerAccount(t *testing.T) {
+	f := &searchCatalogFixture{probeStatus: map[string]int{"@cf/openai/gpt-oss-120b": http.StatusForbidden}}
+	f.mode.Store(1) // search fails
+	server := f.serve(t)
+	if out, err := newCatalog(testGuard(server)).ModelsForAuth(context.Background(), catalogRequest(server, probeOnly)); err != nil || ids(out.Models) != "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8,cloudflare/@cf/qwen/qwen3-30b-a3b-fp8,cloudflare/@cf/openai/gpt-oss-20b" {
+		t.Fatalf("denied fallback model served: %s %v", ids(out.Models), err)
+	}
+}
+
+// Contributor dedup for a priced base: with the free-only guard on, the
+// unpriced "-contributor" sibling is dropped without a probe, but the
+// usable priced base must survive (not lose both to the kit dedup).
+func TestCatalogContributorDedupKeepsUsablePricedBase(t *testing.T) {
+	f := &searchCatalogFixture{}
+	f.setBody(searchBody("@cf/openai/gpt-oss-20b", "@cf/openai/gpt-oss-20b-contributor"))
+	server := f.serve(t)
+	if out, err := newCatalog(testGuard(server)).ModelsForAuth(context.Background(), catalogRequest(server, nil)); err != nil || ids(out.Models) != "cloudflare/@cf/openai/gpt-oss-20b" {
+		t.Fatalf("priced base lost: %s %v", ids(out.Models), err)
+	}
+}
+
+// With probing enabled, a contributor the account cannot use is dropped
+// in favor of its usable base; when both are usable the contributor still
+// wins (the unknown-id fixture above covers that preference).
+func TestCatalogContributorRejectionFallsBackToUsableBase(t *testing.T) {
+	f := &searchCatalogFixture{probeStatus: map[string]int{"@cf/unknown-x/model-contributor": http.StatusForbidden}}
+	f.setBody(searchBody("@cf/unknown-x/model", "@cf/unknown-x/model-contributor"))
+	server := f.serve(t)
+	if out, err := newCatalog(testGuard(server)).ModelsForAuth(context.Background(), catalogRequest(server, probeOnly)); err != nil || ids(out.Models) != "cloudflare/@cf/unknown-x/model" {
+		t.Fatalf("rejected contributor lost the base too: %s %v", ids(out.Models), err)
+	}
+}
+
+// Shared-budget semantics, scaled down: sixteen uncached probes at 200 ms
+// each run in two eight-way batches, so the second batch cannot finish
+// inside the call deadline. The call stays prompt and serves the static
+// fallback instead of running past the deadline. At production scale the
+// same shape applies: sixteen ~9 s probes need two batches under the kit's
+// single 15 s ModelsFetchTimeout, and the overrun discards the fresh
+// result in favor of fallback.
+func TestCatalogSharedDeadlineDiscardsSlowValidation(t *testing.T) {
+	var ids16 []string
+	for i := 0; i < 16; i++ {
+		ids16 = append(ids16, "@cf/budget/m"+string(rune('a'+i)))
+	}
+	f := &searchCatalogFixture{delay: 200 * time.Millisecond}
+	f.setBody(searchBody(ids16...))
+	server := f.serve(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, catalogRequest(server, probeOnly))
+	if err != nil {
+		t.Fatalf("slow validation must serve fallback, not fail: %v", err)
+	}
+	if ids(out.Models) != staticServed {
+		t.Fatalf("slow validation served %s, want static fallback", ids(out.Models))
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("slow validation not bounded: %v", elapsed)
 	}
 }

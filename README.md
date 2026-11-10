@@ -111,11 +111,14 @@ and a probe `Validate` hook, and the kit owns the pipeline around them
 `ModelsForAuth` invocation fetches fresh, subject to the kit's 15 s fetch
 deadline; the kit TTL bounds freshness markers only and never skips a fetch.
 On a failed fetch the kit serves the durable last-good list for that
-credential generation and then the static list. Recovery is **not** retried
+credential generation. With no last-good, the static fallback is validated
+per account with the same probe rules below, so an account denied a static
+model never receives it; a cancelled call cannot probe and serves the
+static list unvalidated. Recovery is **not** retried
 within one call: after a transient failure the next host event fetches again
-— recovery timing is not guaranteed. The static list and durable last-good
-are served as configured without re-probing; only freshly discovered ids
-are validated.
+— recovery timing is not guaranteed. Durable last-good is served as
+configured without re-probing; freshly discovered ids and the static
+fallback are validated.
 
 Discovery uses the official `GET /client/v4/accounts/{account_id}/ai/models/search`
 with `task=Text Generation`, `page` and `per_page=100`. Results are bounded to 20
@@ -135,8 +138,12 @@ without it):
 - 400, 403, 404, 410 or 422: not advertised for this account.
 - 2xx: advertised. 429, 5xx, timeouts and transport errors are inconclusive and
   keep the model, so a transient problem never empties the catalog.
-- At most 8 probes run at once across all discoveries, each bounded to 10 s, the whole validation to
-  30 s. Definitive verdicts are cached per account/token digest for 6 h;
+- At most 8 probes run at once across all discoveries, each bounded to 10 s.
+  Search plus validation share the kit's single 15 s `ModelsFetchTimeout`
+  deadline (the plugin's 30 s validation budget is an inner cap the 15 s
+  deadline binds first), so a validation that outgrows that shared deadline
+  discards the fresh result in favor of last-good/static fallback rather
+  than running past it. Definitive verdicts are cached per account/token digest for 6 h;
   inconclusive models are re-probed on the next discovery.
 - Each probe uses only a few neurons. With `stay_within_free` on, each probe goes
   through the hard stop like inference (charged by the same estimate, with
