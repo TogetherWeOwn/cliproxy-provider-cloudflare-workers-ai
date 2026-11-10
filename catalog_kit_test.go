@@ -322,3 +322,69 @@ func TestCatalogSharedDeadlineDiscardsSlowValidation(t *testing.T) {
 		t.Fatalf("slow validation not bounded: %v", elapsed)
 	}
 }
+
+// Deadline during fallback validation: search fails with no last-good, then
+// the call deadline expires while the static fallback is being probed. The
+// call must serve the static list promptly with a nil error — matching the
+// cancelled-call branch — not propagate the mid-validation deadline error
+// with no catalog.
+func TestCatalogDeadlineDuringFallbackValidationServesStatic(t *testing.T) {
+	f := &searchCatalogFixture{delay: 500 * time.Millisecond}
+	f.mode.Store(1)
+	server := f.serve(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, catalogRequest(server, probeOnly))
+	if err != nil {
+		t.Fatalf("deadline during fallback validation must serve static, not fail: %v", err)
+	}
+	if ids(out.Models) != staticServed {
+		t.Fatalf("deadline during fallback validation served %s, want static", ids(out.Models))
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("fallback deadline not bounded: %v", elapsed)
+	}
+}
+
+// Delayed analytics must not overrun the shared discovery deadline: with the
+// free-only guard on and no usable reading, a failed search starts fallback
+// validation whose first admit starts a single-flight analytics read. The
+// read is bounded by the caller's remaining deadline, so the call stays
+// prompt and serves the static fallback and the delay does not extend the
+// call. Production shape: search fails after 12 s, then a slow analytics
+// read would previously add up to 15 s.
+func TestCatalogDelayedAnalyticsIsBoundedByDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"success":false,"errors":[{"message":"boom"}]}`)
+			return
+		}
+		if r.URL.Path == "/client/v4/graphql" {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-r.Context().Done():
+				return
+			}
+			io.WriteString(w, analyticsBody(`[{"sum":{"totalNeurons":0}}]`))
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"p"},"finish_reason":"length"}]}`)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, catalogRequest(server, nil))
+	if err != nil {
+		t.Fatalf("delayed analytics must serve static, not fail: %v", err)
+	}
+	if ids(out.Models) != staticServed {
+		t.Fatalf("delayed analytics served %s, want static", ids(out.Models))
+	}
+	if elapsed := time.Since(start); elapsed > 1200*time.Millisecond {
+		t.Fatalf("delayed analytics overran the discovery deadline: %v", elapsed)
+	}
+}

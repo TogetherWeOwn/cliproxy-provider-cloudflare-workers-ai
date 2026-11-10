@@ -143,6 +143,9 @@ func (c catalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReque
 		}
 		models, verr := c.validate(dctx, req.HTTPClient, cred, namespacedFallback())
 		if verr != nil {
+			if dctx.Err() != nil {
+				return pluginapi.ModelResponse{Provider: provider, Models: namespacedFallback()}, nil
+			}
 			return pluginapi.ModelResponse{}, verr
 		}
 		resp = pluginapi.ModelResponse{Models: models}

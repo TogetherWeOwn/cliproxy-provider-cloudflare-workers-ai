@@ -193,7 +193,12 @@ func (g *freeGuard) admit(ctx context.Context, c credentials, estimate float64) 
 }
 
 // read runs without the lock. Waiters share it, so one caller's cancellation
-// must not fail theirs; fetchAnalytics bounds it to 15 seconds.
+// must not fail theirs (context.WithoutCancel below). It is still bounded by
+// the caller's own deadline: when the caller has one, the read gets at most
+// the time remaining to it (capped at fetchAnalytics' 15 seconds), so a
+// discovery whose search already consumed most of the shared 15s deadline
+// cannot overrun it on a slow analytics read. A timed-out read fails closed
+// (usageUnverified); a still-usable older reading may serve as before.
 //
 // It uses the plugin's own client, not the executor's host HTTP client. The
 // host client is bound to the inference request's context, so it would write
@@ -221,7 +226,20 @@ func (g *freeGuard) read(ctx context.Context, c credentials, now time.Time) (use
 	if endpoint == "" {
 		endpoint = selectedBase(upstreamBase) + "/client/v4/graphql"
 	}
-	return fetchAnalytics(kit.WithProxyURL(context.WithoutCancel(ctx), proxy), g.client, endpoint, c, now)
+	readCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout := time.Until(deadline)
+		if timeout < 0 {
+			timeout = 0
+		}
+		if timeout > 15*time.Second {
+			timeout = 15 * time.Second
+		}
+		var cancel context.CancelFunc
+		readCtx, cancel = context.WithTimeout(readCtx, timeout)
+		defer cancel()
+	}
+	return fetchAnalytics(kit.WithProxyURL(readCtx, proxy), g.client, endpoint, c, now)
 }
 func (l *ledger) usable(now time.Time, maxAge time.Duration) bool {
 	return !l.readAt.IsZero() && l.day.Equal(utcDay(now)) && !l.readAt.After(now) && now.Sub(l.readAt) < maxAge
