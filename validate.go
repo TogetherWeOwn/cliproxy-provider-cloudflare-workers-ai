@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -17,9 +18,9 @@ import (
 // chat request for one account (403 "account is not allowed to access", 403
 // "Model Agreement: ... you must submit the prompt 'agree'", 400 "required
 // properties ... 'model,state,questions'", 400 "AI model does not have config").
-// ModelsForAuth validates each candidate with a one-token chat probe and only
-// advertises models the account can actually use. The plugin never submits a
-// license agreement on the operator's behalf.
+// ModelsForAuth validates each discovered candidate with a one-token chat
+// probe and only advertises models the account can actually use. The plugin
+// never submits a license agreement on the operator's behalf.
 const (
 	probeConcurrency = 8
 	probeTimeout     = 10 * time.Second
@@ -27,10 +28,36 @@ const (
 	verdictTTL       = 6 * time.Hour
 )
 
+// contributorBasePresent is the internal Type tag Fetch sets on a
+// "-contributor" entry whose base id is also in the search results (see
+// markContributorBases). Validate strips it before serving.
+const contributorBasePresent = "contributor-base-present"
+
+// validateModels is the kit Validate hook: it receives glob-filtered,
+// override-applied upstream ids (before the kit namespace step) plus the
+// request. It runs on the fresh path; durable last-good results are served
+// trusted (validated when fresh). The static fallback is validated by
+// ModelsForAuth itself, which calls validate directly.
+func (c catalog) validateModels(ctx context.Context, req pluginapi.AuthModelRequest, candidates []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
+	cred, err := credentialsFrom(req.StorageJSON, req.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if req.HTTPClient == nil {
+		return nil, &pluginabi.Error{Code: "host_unavailable", Message: "model discovery requires the host HTTP client", HTTPStatus: 503}
+	}
+	return c.validate(ctx, req.HTTPClient, cred, candidates)
+}
+
 func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, cred credentials, candidates []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
 	budget, cancel := context.WithTimeout(ctx, discoveryBudget)
 	defer cancel()
 	digest := sha256.Sum256([]byte(cred.account + "\x00" + cred.token))
+	// The kit drops a base id when its "-contributor" sibling is present,
+	// before this hook runs. Expand marked contributors with their base so
+	// a usable base survives an ineligible contributor; the final pass
+	// below keeps the contributor preference when both are eligible.
+	candidates, contributorOf, baseOf := expandContributorBases(candidates)
 	alive := make([]bool, len(candidates))
 	sem := c.probes
 	if sem == nil {
@@ -73,13 +100,60 @@ func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	indexOf := make(map[string]int, len(candidates))
+	for i, m := range candidates {
+		indexOf[m.ID] = i
+	}
 	out := make([]pluginapi.ModelInfo, 0, len(candidates))
 	for i, m := range candidates {
-		if alive[i] {
-			out = append(out, m)
+		if !alive[i] {
+			continue
 		}
+		m.Type = "" // strip the internal contributor tag
+		if _, isContributor := contributorOf[m.ID]; isContributor {
+			out = append(out, m) // preferred sibling: keep it, drop its base
+			continue
+		}
+		if contributor, isBase := baseOf[m.ID]; isBase {
+			// The base stands in only when its contributor is ineligible.
+			if alive[indexOf[contributor]] {
+				continue
+			}
+		}
+		out = append(out, m)
 	}
 	return out, nil
+}
+
+// expandContributorBases re-adds the base id the kit's contributor dedup
+// removed, for every candidate Fetch tagged with contributorBasePresent.
+// It returns the expanded list plus the two pairing maps (contributor ->
+// base, base -> contributor). A base is added only when it is not already a
+// candidate; the pairing is still recorded then, so dedup is enforced by
+// the final pass either way.
+func expandContributorBases(candidates []pluginapi.ModelInfo) (expanded []pluginapi.ModelInfo, contributorOf, baseOf map[string]string) {
+	present := make(map[string]bool, len(candidates))
+	for _, m := range candidates {
+		present[m.ID] = true
+	}
+	contributorOf = make(map[string]string)
+	baseOf = make(map[string]string)
+	expanded = make([]pluginapi.ModelInfo, 0, len(candidates))
+	for _, m := range candidates {
+		expanded = append(expanded, m)
+		base, marked := strings.CutSuffix(m.ID, "-contributor")
+		if !marked || m.Type != contributorBasePresent || base == "" {
+			continue
+		}
+		contributorOf[m.ID] = base
+		baseOf[base] = m.ID
+		if present[base] {
+			continue
+		}
+		present[base] = true
+		expanded = append(expanded, pluginapi.ModelInfo{ID: base, Object: m.Object, OwnedBy: m.OwnedBy, DisplayName: base})
+	}
+	return expanded, contributorOf, baseOf
 }
 
 // probeModel sends a one-token NON-streaming chat request and decides on the

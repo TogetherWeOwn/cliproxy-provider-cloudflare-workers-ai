@@ -98,7 +98,12 @@ func TestModelsForAuthAdvertisesOnlyModelsTheAccountCanUse(t *testing.T) {
 	}
 }
 
-func TestModelsForAuthHonoursCancellationDuringValidation(t *testing.T) {
+// Mid-call cancellation no longer fails the call: the kit catalog serves its
+// durable fallback (static here) promptly instead of propagating the
+// cancelled fetch/validate error. What is asserted is bounded, prompt
+// completion on cancellation; a call that starts cancelled still returns
+// the context error at entry.
+func TestModelsForAuthCancellationServesStaticFallback(t *testing.T) {
 	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ai/models/search") {
 			io.WriteString(w, `{"success":true,"errors":[],"result":[{"name":"@cf/slow/a","task":{"name":"Text Generation"}}],"result_info":{"page":1,"total_pages":1}}`)
@@ -110,8 +115,19 @@ func TestModelsForAuthHonoursCancellationDuringValidation(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), Metadata: probeOnly, HTTPClient: mockHostClient{server}}); err == nil {
-		t.Fatal("cancelled discovery returned a catalog")
+	out, err := newCatalog(testGuard(server)).ModelsForAuth(ctx, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), Metadata: probeOnly, HTTPClient: mockHostClient{server}})
+	if err != nil {
+		t.Fatal("cancelled discovery must serve the static fallback, not fail", err)
+	}
+	want := "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8,cloudflare/@cf/qwen/qwen3-30b-a3b-fp8,cloudflare/@cf/openai/gpt-oss-120b,cloudflare/@cf/openai/gpt-oss-20b"
+	if got := ids(out.Models); got != want {
+		t.Fatalf("cancelled discovery served %s, want static %s", got, want)
+	}
+	// A call that starts cancelled still fails at entry.
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if _, err := newCatalog(testGuard(server)).ModelsForAuth(cancelled, pluginapi.AuthModelRequest{StorageJSON: authJSON(testAccount, "example-key"), Metadata: probeOnly, HTTPClient: mockHostClient{server}}); err == nil {
+		t.Fatal("entry-cancelled discovery must return the context error")
 	}
 }
 

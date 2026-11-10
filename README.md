@@ -3,7 +3,7 @@
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, a **daily neuron quota card** and a
 **free-only hard stop** that is on by default. Uses the
-[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `88850ce`
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `v0.5.0`
 and the real **CLIProxyAPI v8.0.49** C-ABI loader (ABI 1, RPC schema 10). Requires CLIProxyAPI
 **v8.0.49 or newer**: the kit refuses hosts older than RPC schema 10.
 
@@ -104,16 +104,33 @@ call.
 
 ## Models and execution
 
+Model serving runs through the cliproxy-provider-kit `ModelCatalog` (v0.5.0):
+the plugin owns a custom `Fetch` (the paginated `models/search` call below)
+and a probe `Validate` hook, and the kit owns the pipeline around them
+(single-flight, durable last-good, namespace application). Every
+`ModelsForAuth` invocation fetches fresh, subject to the kit's 15 s fetch
+deadline; the kit TTL bounds freshness markers only and never skips a fetch.
+On a failed fetch the kit serves the durable last-good list for that
+credential generation. With no last-good, the static fallback is validated
+per account with the same probe rules below, so an account denied a static
+model never receives it; a cancelled call cannot probe and serves the
+static list unvalidated. Recovery is **not** retried
+within one call: after a transient failure the next host event fetches again
+— recovery timing is not guaranteed. Durable last-good is served as
+configured without re-probing; freshly discovered ids and the static
+fallback are validated.
+
 Discovery uses the official `GET /client/v4/accounts/{account_id}/ai/models/search`
 with `task=Text Generation`, `page` and `per_page=100`. Results are bounded to 20
 pages, deduplicated, and filtered to supported text-generation model names.
-Unavailable/malformed discovery falls back to a small static catalog.
+Unavailable/malformed discovery falls back to the durable last-good list and
+then the small static catalog.
 
 The catalog is public, not per-account availability: in a live check on
 2026-10-31, 7 of 39 listed text-generation models failed a minimal chat request
 for one account (403 not allowed for the account, 403 license agreement not yet
-accepted, 400 non-chat input schema, 400 model has no config). Discovered and
-fallback IDs are therefore **validated per account** with a one-token
+accepted, 400 non-chat input schema, 400 model has no config). Freshly discovered
+IDs are therefore **validated per account** with a one-token
 non-streaming chat probe (`max_tokens: 1`; non-streaming because some models,
 e.g. `@cf/meta/llama-guard-3-8b`, reject `stream: true` but serve requests
 without it):
@@ -121,8 +138,12 @@ without it):
 - 400, 403, 404, 410 or 422: not advertised for this account.
 - 2xx: advertised. 429, 5xx, timeouts and transport errors are inconclusive and
   keep the model, so a transient problem never empties the catalog.
-- At most 8 probes run at once across all discoveries, each bounded to 10 s, the whole validation to
-  30 s. Definitive verdicts are cached per account/token digest for 6 h;
+- At most 8 probes run at once across all discoveries, each bounded to 10 s.
+  Search plus validation share the kit's single 15 s `ModelsFetchTimeout`
+  deadline (the plugin's 30 s validation budget is an inner cap the 15 s
+  deadline binds first), so a validation that outgrows that shared deadline
+  discards the fresh result in favor of last-good/static fallback rather
+  than running past it. Definitive verdicts are cached per account/token digest for 6 h;
   inconclusive models are re-probed on the next discovery.
 - Each probe uses only a few neurons. With `stay_within_free` on, each probe goes
   through the hard stop like inference (charged by the same estimate, with

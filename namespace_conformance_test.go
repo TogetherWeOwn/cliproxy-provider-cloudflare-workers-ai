@@ -18,10 +18,9 @@ import (
 func TestModelNamespaceConformance(t *testing.T) {
 	ctx := context.Background()
 	var all []pluginapi.ModelInfo
-	all = append(all, fallbackModels()...)
 
 	guard := newFreeGuard(nil)
-	reg, err := catalog{}.RegisterModels(ctx, pluginapi.ModelRegistrationRequest{})
+	reg, err := newCatalog(newFreeGuard(nil)).RegisterModels(ctx, pluginapi.ModelRegistrationRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
