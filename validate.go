@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -17,15 +18,30 @@ import (
 // chat request for one account (403 "account is not allowed to access", 403
 // "Model Agreement: ... you must submit the prompt 'agree'", 400 "required
 // properties ... 'model,state,questions'", 400 "AI model does not have config").
-// ModelsForAuth validates each candidate with a one-token chat probe and only
-// advertises models the account can actually use. The plugin never submits a
-// license agreement on the operator's behalf.
+// ModelsForAuth validates each discovered candidate with a one-token chat
+// probe and only advertises models the account can actually use. The plugin
+// never submits a license agreement on the operator's behalf.
 const (
 	probeConcurrency = 8
 	probeTimeout     = 10 * time.Second
 	discoveryBudget  = 30 * time.Second
 	verdictTTL       = 6 * time.Hour
 )
+
+// validateModels is the kit Validate hook: it receives glob-filtered,
+// override-applied upstream ids (before the kit namespace step) plus the
+// request. It runs only on the fresh path; durable last-good and static
+// results are already validated or trusted as configured.
+func (c catalog) validateModels(ctx context.Context, req pluginapi.AuthModelRequest, candidates []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
+	cred, err := credentialsFrom(req.StorageJSON, req.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if req.HTTPClient == nil {
+		return nil, &pluginabi.Error{Code: "host_unavailable", Message: "model discovery requires the host HTTP client", HTTPStatus: 503}
+	}
+	return c.validate(ctx, req.HTTPClient, cred, candidates)
+}
 
 func (c catalog) validate(ctx context.Context, client pluginapi.HostHTTPClient, cred credentials, candidates []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
 	budget, cancel := context.WithTimeout(ctx, discoveryBudget)
