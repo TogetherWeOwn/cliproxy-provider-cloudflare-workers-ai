@@ -65,14 +65,27 @@ func fallbackModels() []pluginapi.ModelInfo {
 }
 
 // RegisterModels serves the static list through the kit pipeline, for
-// development-time registration.
+// development-time registration. The kit stamps Provider from the plugin
+// metadata name ("Cloudflare Workers AI"), but the host registers static
+// catalogs under the provider id ("cloudflare-workers-ai"), so the wrapper
+// rewrites it; the old hand-rolled code already returned the provider id.
 func (c catalog) RegisterModels(ctx context.Context, req pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
-	return c.inner.RegisterModels(ctx, req)
+	resp, err := c.inner.RegisterModels(ctx, req)
+	if err != nil {
+		return pluginapi.ModelRegistrationResponse{}, err
+	}
+	resp.Provider = provider
+	return resp, nil
 }
 
 func (c catalog) StaticModels(ctx context.Context, req pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
 	c.guard.observeHost(req.Host)
-	return c.inner.StaticModels(ctx, req)
+	resp, err := c.inner.StaticModels(ctx, req)
+	if err != nil {
+		return pluginapi.ModelResponse{}, err
+	}
+	resp.Provider = provider
+	return resp, nil
 }
 
 func (c catalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
@@ -95,7 +108,14 @@ func (c catalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReque
 	}
 	// Every invocation fetches fresh through the kit catalog (no TTL skip);
 	// a transient failure serves durable last-good, then the static list.
-	return c.inner.ModelsForAuth(ctx, req)
+	// Provider is rewritten to the provider id for the same registry reason
+	// as in RegisterModels above.
+	resp, err := c.inner.ModelsForAuth(ctx, req)
+	if err != nil {
+		return pluginapi.ModelResponse{}, err
+	}
+	resp.Provider = provider
+	return resp, nil
 }
 
 // fetch is the kit FetchModelsFunc: the plugin-owned paginated

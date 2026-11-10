@@ -196,6 +196,27 @@ func TestCatalogParseFailureFallsBackToStatic(t *testing.T) {
 	}
 }
 
+// The kit stamps Provider from the plugin metadata name; the host registers
+// catalogs under the provider id, so the wrappers must report the id.
+func TestCatalogProviderIsProviderID(t *testing.T) {
+	f := &searchCatalogFixture{}
+	f.setBody(searchBody("@cf/openai/gpt-oss-20b"))
+	server := f.serve(t)
+	c := newCatalog(testGuard(server))
+	reg, err := c.RegisterModels(context.Background(), pluginapi.ModelRegistrationRequest{})
+	if err != nil || reg.Provider != provider {
+		t.Fatalf("RegisterModels provider %q %v", reg.Provider, err)
+	}
+	static, err := c.StaticModels(context.Background(), pluginapi.StaticModelRequest{})
+	if err != nil || static.Provider != provider {
+		t.Fatalf("StaticModels provider %q %v", static.Provider, err)
+	}
+	out, err := c.ModelsForAuth(context.Background(), catalogRequest(server, probeOnly))
+	if err != nil || out.Provider != provider {
+		t.Fatalf("ModelsForAuth provider %q %v", out.Provider, err)
+	}
+}
+
 // Enforceable deadline: a search fetch that blocks forever does not hang
 // the callback; parent cancellation propagates and the static fallback
 // serves.
