@@ -157,29 +157,25 @@ func (g *freeGuard) admit(ctx context.Context, c credentials, estimate float64) 
 	if now := g.now(); l.usable(now, readingTTL) {
 		return l.charge(estimate, now)
 	}
-	if wait := l.pending; wait != nil {
-		// Single flight per account: share the read already in progress.
-		g.mu.Unlock()
-		select {
-		case <-wait:
-			g.mu.Lock()
-		case <-ctx.Done():
-			g.mu.Lock()
-			return ctx.Err()
-		}
-	} else {
-		done := make(chan struct{})
-		l.pending = done
-		g.mu.Unlock()
-		start := g.now()
-		used, err := g.read(ctx, c, start)
+	// Single flight per account: the first caller publishes the flight under
+	// the lock, captures its start, and runs the read in one worker; every
+	// caller — the initiator included — then waits on the same completion
+	// channel with its own ctx. The read is detached from each caller's
+	// cancellation and deadline, so a caller that stops waiting cannot kill
+	// the flight for the others (see runRead).
+	if l.pending == nil {
+		wait := make(chan struct{})
+		l.pending = wait
+		go g.runRead(wait, l, c, g.now(), ctx)
+	}
+	wait := l.pending
+	g.mu.Unlock()
+	select {
+	case <-wait:
 		g.mu.Lock()
-		// A read crossing UTC midnight belongs to neither day.
-		if err == nil && utcDay(g.now()).Equal(utcDay(start)) && !start.Before(l.readAt) {
-			l.day, l.used, l.readAt = utcDay(start), used, start
-		}
-		l.pending = nil
-		close(done)
+	case <-ctx.Done():
+		g.mu.Lock()
+		return ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -192,12 +188,37 @@ func (g *freeGuard) admit(ctx context.Context, c credentials, estimate float64) 
 	return usageUnverifiedError()
 }
 
-// read runs without the lock. Waiters share it, so one caller's cancellation
-// must not fail theirs (context.WithoutCancel below). It is still bounded by
-// the caller's own deadline: when the caller has one, the read gets at most
-// the time remaining to it (capped at fetchAnalytics' 15 seconds), so a
-// discovery whose search already consumed most of the shared 15s deadline
-// cannot overrun it on a slow analytics read. A timed-out read fails closed
+// runRead performs the shared single-flight analytics read for one ledger,
+// in one worker goroutine outside admit's wait. It holds the ledger reference
+// through completion, publishes valid readings under g.mu (read-start
+// ordering, same-UTC-day and monotonic checks), and clears pending and closes
+// the flight channel exactly once on every path: read recovers its own
+// panics, and the deferred cleanup runs even if publishing itself panicked.
+// A caller that already stopped waiting never charges from here — only
+// callers still live when the flight closes charge, under the lock in admit.
+func (g *freeGuard) runRead(wait chan struct{}, l *ledger, c credentials, start time.Time, ctx context.Context) {
+	used, err := g.read(ctx, c, start)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	defer func() {
+		if l.pending == wait {
+			l.pending = nil
+		}
+		close(wait)
+	}()
+	// A read crossing UTC midnight belongs to neither day.
+	if err == nil && utcDay(g.now()).Equal(utcDay(start)) && !start.Before(l.readAt) {
+		l.day, l.used, l.readAt = utcDay(start), used, start
+	}
+}
+
+// read runs outside the lock, in the single flight worker (see runRead).
+// Waiters share it, so every caller's cancellation and deadline are detached
+// (context.WithoutCancel preserves the values the request needs without
+// propagating the initiator's done): a short-deadline caller that stops
+// waiting cannot kill the flight for longer-lived waiters. The read's bound
+// is owned by fetchAnalytics (quota.go): one 15-second HTTP context from
+// flight start, with no retries. A timed-out read fails closed
 // (usageUnverified); a still-usable older reading may serve as before.
 //
 // It uses the plugin's own client, not the executor's host HTTP client. The
@@ -227,18 +248,6 @@ func (g *freeGuard) read(ctx context.Context, c credentials, now time.Time) (use
 		endpoint = selectedBase(upstreamBase) + "/client/v4/graphql"
 	}
 	readCtx := context.WithoutCancel(ctx)
-	if deadline, ok := ctx.Deadline(); ok {
-		timeout := time.Until(deadline)
-		if timeout < 0 {
-			timeout = 0
-		}
-		if timeout > 15*time.Second {
-			timeout = 15 * time.Second
-		}
-		var cancel context.CancelFunc
-		readCtx, cancel = context.WithTimeout(readCtx, timeout)
-		defer cancel()
-	}
 	return fetchAnalytics(kit.WithProxyURL(readCtx, proxy), g.client, endpoint, c, now)
 }
 func (l *ledger) usable(now time.Time, maxAge time.Duration) bool {

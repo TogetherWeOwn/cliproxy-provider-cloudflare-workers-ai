@@ -382,6 +382,164 @@ func TestGuardWaiterHonoursItsOwnCancellation(t *testing.T) {
 	}
 }
 
+// The flight initiator cancelling (or its deadline firing) must not poison
+// the flight for the callers that are still waiting on it: the worker-owned
+// read is detached from the initiator, so the waiter is admitted from the
+// same single flight. Counterpart: TestGuardWaiterHonoursItsOwnCancellation.
+func TestGuardLeaderCancellationLeavesWaiterUnaffected(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var polls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		polls.Add(1)
+		startedOnce.Do(func() { close(started) })
+		<-release
+		io.WriteString(w, analyticsBody(`[]`))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	g, c := testGuard(server), freeCredentials(t, nil)
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	defer leaderCancel()
+	leaderDone := make(chan error, 1)
+	go func() { leaderDone <- g.admit(leaderCtx, c, 1) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("analytics read never started")
+	}
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- g.admit(context.Background(), c, 1) }()
+	leaderCancel()
+	select {
+	case err := <-leaderDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("leader got %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader ignored cancellation")
+	}
+	// The waiter is still live on the same flight while analytics is gated.
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("waiter finished before the flight: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("waiter after leader cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never completed")
+	}
+	if n := polls.Load(); n != 1 {
+		t.Fatalf("polls %d, want exactly 1 analytics request", n)
+	}
+}
+
+// When every caller has left, the worker-owned flight may still finish
+// within its bound — but it must never charge the cancelled callers, and it
+// must still clean up (pending cleared) without stranding the next caller.
+func TestGuardAllCallersLeavingCleansUpWithoutCharges(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedOnce.Do(func() { close(started) })
+		<-release
+		io.WriteString(w, analyticsBody(`[]`))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	g, c := testGuard(server), freeCredentials(t, nil)
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	waiterCtx, waiterCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	waiterDone := make(chan error, 1)
+	go func() { leaderDone <- g.admit(leaderCtx, c, 1) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("analytics read never started")
+	}
+	go func() { waiterDone <- g.admit(waiterCtx, c, 1) }()
+	leaderCancel()
+	waiterCancel()
+	// Both callers must observe their own cancellation.
+	for name, done := range map[string]chan error{"leader": leaderDone, "waiter": waiterDone} {
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s got %v, want context.Canceled", name, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s ignored cancellation", name)
+		}
+	}
+	// The flight completes, publishes, and cleans up with no charges.
+	close(release)
+	cleaned := func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		l := g.accounts[c.account]
+		return l != nil && l.pending == nil
+	}
+	giveUp := time.Now().Add(5 * time.Second)
+	for !cleaned() {
+		if time.Now().After(giveUp) {
+			t.Fatal("flight never cleaned up after all callers left")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	g.mu.Lock()
+	l := g.accounts[c.account]
+	admitted := len(l.admitted)
+	g.mu.Unlock()
+	if admitted != 0 {
+		t.Fatalf("%d charges for cancelled callers, want 0", admitted)
+	}
+	// The next caller is served by the published reading (no second poll).
+	if err := g.admit(context.Background(), c, 1); err != nil {
+		t.Fatalf("next admit after all-left flight: %v", err)
+	}
+}
+
+type panickingDoer struct{}
+
+func (panickingDoer) Do(*http.Request) (*http.Response, error) { panic("analytics boom") }
+
+func TestGuardPanickingAnalyticsFailsClosed(t *testing.T) {
+	g := newFreeGuard(panickingDoer{})
+	g.endpoint = unroutableAnalytics
+	g.observeHost(pluginapi.HostConfigSummary{})
+	c := freeCredentials(t, nil)
+	wantCode(t, g.admit(context.Background(), c, 1), "quota_unverified")
+	// The flight closed exactly once: the next caller retries cleanly,
+	// it neither hangs nor panics on a stranded pending channel.
+	wantCode(t, g.admit(context.Background(), c, 1), "quota_unverified")
+	g.mu.Lock()
+	pending := g.accounts[c.account].pending != nil
+	g.mu.Unlock()
+	if pending {
+		t.Fatal("panicking flight stranded pending")
+	}
+}
+
 func TestExecutorRefusesBeforeDispatchOnEveryPath(t *testing.T) {
 	var chats atomic.Int32
 	server := httptest.NewServer(withAnalytics(9900, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -386,5 +387,151 @@ func TestCatalogDelayedAnalyticsIsBoundedByDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 1200*time.Millisecond {
 		t.Fatalf("delayed analytics overran the discovery deadline: %v", elapsed)
+	}
+}
+
+// Shared quota-read lifetime: the discovery leader starts the single-flight
+// analytics read with a short deadline; an inference waiter joins the same
+// flight and must not be failed with quota_unverified when the leader's
+// deadline fires. Analytics is gated on a channel barrier, never on timing:
+// the leader returns its static fallback at its own deadline while the flight
+// survives, then the inference waiter is admitted with exactly one analytics
+// request. The executor path (newExecutor) is exercised, not abstract admits.
+func TestSharedFlightSurvivesShortDeadlineLeader(t *testing.T) {
+	var polls, chats atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handlerReturned := make(chan struct{})
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/ai/models/search"):
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"success":false,"errors":[{"message":"boom"}]}`)
+		case r.URL.Path == "/client/v4/graphql":
+			polls.Add(1)
+			startedOnce.Do(func() { close(started) })
+			defer close(handlerReturned)
+			select {
+			case <-release:
+				io.WriteString(w, analyticsBody(`[{"sum":{"totalNeurons":0}}]`))
+			case <-r.Context().Done():
+			}
+		default:
+			chats.Add(1)
+			io.WriteString(w, `{"object":"chat.completion","choices":[]}`)
+		}
+	}))
+	// Cleanup order: release before close, so a fatal mid-test cannot hang.
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	g := testGuard(server)
+	cat, ex := newCatalog(g), newExecutor(g)
+
+	leaderCtx, leaderCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer leaderCancel()
+	type leaderResult struct {
+		models string
+		err    error
+	}
+	leaderDone := make(chan leaderResult, 1)
+	go func() {
+		out, err := cat.ModelsForAuth(leaderCtx, catalogRequest(server, nil))
+		leaderDone <- leaderResult{models: ids(out.Models), err: err}
+	}()
+
+	// The flight has started: analytics is in progress, gated on release.
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("analytics read never started")
+	}
+
+	// Inference joins the same flight through the executor and waits.
+	inferenceDone := make(chan error, 1)
+	go func() {
+		_, err := ex.Execute(context.Background(), pluginapi.ExecutorRequest{
+			Payload:     []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8","max_tokens":1}`),
+			StorageJSON: authJSON(testAccount, "example-key"),
+			HTTPClient:  mockHostClient{server},
+		})
+		inferenceDone <- err
+	}()
+
+	// Before the leader deadline fires: the flight is pending, exactly one
+	// analytics request exists, and inference has not finished.
+	pending := func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		l := g.accounts[testAccount]
+		return l != nil && l.pending != nil
+	}
+	giveUp := time.Now().Add(5 * time.Second)
+	for !pending() {
+		if time.Now().After(giveUp) {
+			t.Fatal("no pending flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-inferenceDone:
+		t.Fatalf("inference finished before the flight: %v", err)
+	default:
+	}
+	if n := polls.Load(); n != 1 {
+		t.Fatalf("polls %d before leader expiry, want 1", n)
+	}
+
+	// The leader returns its static fallback at its own deadline, promptly,
+	// without any probe or chat dispatch, while analytics stays gated — its
+	// request was not cancelled by the leader's deadline.
+	select {
+	case res := <-leaderDone:
+		if res.err != nil || res.models != staticServed {
+			t.Fatalf("leader served %s %v, want the %s static fallback", res.models, res.err, staticServed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader did not return at its deadline")
+	}
+	if n := chats.Load(); n != 0 {
+		t.Fatalf("%d chat dispatches before analytics arrived", n)
+	}
+	select {
+	case <-handlerReturned:
+		t.Fatal("analytics request died with the leader's deadline")
+	default:
+	}
+
+	// Valid analytics arrives: the live inference waiter is admitted and
+	// dispatches exactly one chat through the executor, with one analytics
+	// request total and the pending flight cleared.
+	close(release)
+	select {
+	case err := <-inferenceDone:
+		if err != nil {
+			t.Fatalf("inference after valid analytics: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("inference did not complete after valid analytics")
+	}
+	if n := polls.Load(); n != 1 {
+		t.Fatalf("polls %d, want exactly 1 analytics request", n)
+	}
+	if n := chats.Load(); n != 1 {
+		t.Fatalf("chat dispatches %d, want 1", n)
+	}
+	select {
+	case <-handlerReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("analytics handler never returned")
+	}
+	if pending() {
+		t.Fatal("pending flight never cleared")
 	}
 }
