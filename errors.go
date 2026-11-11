@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -38,6 +39,10 @@ func classifyFailure(resp pluginapi.HTTPResponse, now time.Time) *pluginabi.Erro
 		if hasErrorCode(resp.Body, 3036) || (strings.Contains(body, "daily") && strings.Contains(body, "neuron")) {
 			e.Code, e.Message = "quota_exhausted", "Workers AI daily free neuron allocation exhausted"
 			e.RetryAfterSeconds = int(math.Ceil(nextReset(now).Sub(now).Seconds()))
+			// The daily neuron allocation is accountTag-wide (quota.go:
+			// "Aggregate account-wide"), so the whole credential rests until
+			// the UTC reset instead of cool-only-the-reporting-model.
+			e.CredentialScoped = true
 		} else {
 			e.Code, e.Message, e.RetryAfterSeconds = "rate_limit", "Workers AI rate or capacity limit reached", 5
 		}
@@ -57,6 +62,58 @@ func classifyFailure(resp pluginapi.HTTPResponse, now time.Time) *pluginabi.Erro
 	}
 	return e
 }
+
+// streamQuotaError surfaces an account-wide quota refusal embedded in a 200
+// upstream SSE event. Workers AI can signal daily neuron exhaustion inside a
+// streaming response, where the HTTP-status classification above never runs.
+// Only the credential-scoped 3036/daily-neuron shape is intercepted: the event
+// is classified through the same 429 rules so the stream chunk error keeps the
+// scoped flag, and every other event shape returns nil and passes through.
+func streamQuotaError(payload []byte, now time.Time) *pluginabi.Error {
+	data := streamDataValue(payload)
+	if data == nil {
+		return nil
+	}
+	e := classifyFailure(pluginapi.HTTPResponse{StatusCode: http.StatusTooManyRequests, Body: data}, now)
+	if !e.CredentialScoped {
+		return nil
+	}
+	return e
+}
+
+// streamDataValue extracts the JSON data value from one framed stream chunk:
+// bare JSON for OpenAI-output framing, a data:-prefixed event for translator
+// framing, or a full native SSE event whose data lines are joined. Returns nil
+// when the chunk carries no data payload.
+func streamDataValue(payload []byte) []byte {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return trimmed
+	}
+	var event []byte
+	for _, line := range bytes.Split(trimmed, []byte("\n")) {
+		v, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
+		}
+		v = bytes.TrimPrefix(v, []byte(" ")) // SSE permits one leading space
+		event = append(event, bytes.TrimRight(v, "\r")...)
+		event = append(event, '\n')
+	}
+	if len(event) == 0 {
+		return nil
+	}
+	event = event[:len(event)-1]
+	var compact bytes.Buffer
+	if json.Compact(&compact, event) == nil {
+		return compact.Bytes()
+	}
+	return event
+}
+
 func hasErrorCode(raw []byte, wanted int) bool {
 	var wire struct {
 		Errors []struct {

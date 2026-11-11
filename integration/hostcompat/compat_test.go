@@ -125,7 +125,7 @@ func fixtureOf(body map[string]any) (fx fixture) {
 	return fx
 }
 
-// Real v8.0.49 dlopen, C-ABI registration, RPC dispatch, auth persistence and
+// Real v8.0.63 dlopen, C-ABI registration, RPC dispatch, auth persistence and
 // executor adapters. The only provider network target is an httptest server.
 func TestRealHostLoader(t *testing.T) {
 	var polls, revokedPolls atomic.Int32
@@ -263,7 +263,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("registration %+v", host.RegisteredPlugins())
 	}
 	info := host.RegisteredPlugins()
-	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.2.4" {
+	if len(info) != 1 || !info[0].SupportsQuota || info[0].Metadata.Version != "0.2.5" {
 		t.Fatalf("metadata %+v", info)
 	}
 	fileRaw := authJSON("example-key")
@@ -344,12 +344,14 @@ func TestRealHostLoader(t *testing.T) {
 		}
 		chunks.Write(c.Payload)
 	}
-	// The kit re-frames to one data event per chunk and drops the SSE
-	// [DONE] marker (the host appends its own terminator): the stream ends
-	// by channel close. The core-executor call carries no chat route, so
-	// the chunks stay data-framed.
-	if want := `data: {"id":"chat-example","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` +
-		`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`; chunks.String() != want {
+	// The kit re-frames upstream SSE into one complete SSE event per data
+	// event; the pinned host's deframer releases each event incrementally
+	// and the same-format translator strips the "data:" prefix, so the
+	// adapter delivers bare JSON. The upstream [DONE] is dropped (the
+	// host's own terminator is likewise consumed by the translator) and
+	// the stream ends by channel close.
+	if want := `{"id":"chat-example","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` +
+		`{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`; chunks.String() != want {
 		t.Fatalf("stream %q want %q", chunks.String(), want)
 	}
 	opts.Stream = false
@@ -564,7 +566,7 @@ func TestRealHostLoader(t *testing.T) {
 		if state == nil || !state.Quota.Exceeded {
 			t.Fatalf("host changed; revisit documented RPC limitation %+v", state)
 		}
-		t.Log("v8.0.49 RPC drops the transient marker; rate/capacity 429 is marked model quota-exceeded")
+		t.Log("v8.0.63 RPC drops the transient marker; rate/capacity 429 is marked model quota-exceeded")
 	})
 }
 func TestRegistryUsesNativeStoreSchema(t *testing.T) {
@@ -573,7 +575,7 @@ func TestRegistryUsesNativeStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg, err := pluginstore.ParseRegistry(raw)
-	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.2.4" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
+	if err != nil || reg.SchemaVersion != 1 || len(reg.Plugins) != 1 || reg.Plugins[0].ID != provider || reg.Plugins[0].Version != "0.2.5" || pluginstore.PluginInstallType(reg.Plugins[0]) != "github-release" {
 		t.Fatalf("registry %+v %v", reg, err)
 	}
 }
