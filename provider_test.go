@@ -351,17 +351,24 @@ func TestStreamContentWithQuotaWordsPassesThrough(t *testing.T) {
 	}
 }
 
-// When the consumer stops reading a cancelled stream, the forwarding goroutine
-// must not wedge on a send: it drops the pending chunk, runs the release, and
-// closes the output channel.
+// When the consumer abandons a stream the forwarding goroutine must not wedge
+// on a send: it drops the pending chunk, runs the release, and closes the
+// output channel. Nothing reads the output until the release has fired, so a
+// send can never be ready — a bare `out <- c` would deadlock and hit the
+// timeout instead of passing.
 func TestClassifyStreamEventsCancelWithoutReader(t *testing.T) {
 	in := make(chan pluginapi.ExecutorStreamChunk, 2)
 	in <- pluginapi.ExecutorStreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"x"}}]}`)}
 	in <- pluginapi.ExecutorStreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"y"}}]}`)}
 	released := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already abandoned before forwarding starts, so no send can win
+	cancel() // already abandoned before forwarding starts
 	out := classifyStreamEvents(ctx, in, func() { close(released) })
+	select {
+	case <-released:
+	case <-time.After(4 * time.Second):
+		t.Fatal("cancelled stream never ran release")
+	}
 	select {
 	case _, ok := <-out:
 		if ok {
@@ -369,10 +376,5 @@ func TestClassifyStreamEventsCancelWithoutReader(t *testing.T) {
 		}
 	case <-time.After(4 * time.Second):
 		t.Fatal("cancelled stream never closed")
-	}
-	select {
-	case <-released:
-	case <-time.After(4 * time.Second):
-		t.Fatal("cancelled stream never ran release")
 	}
 }
