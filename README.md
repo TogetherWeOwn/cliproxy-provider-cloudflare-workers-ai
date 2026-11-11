@@ -3,7 +3,7 @@
 First-class account/token auth files, namespaced model discovery, streaming and
 non-streaming OpenAI chat execution, a **daily neuron quota card** and a
 **free-only hard stop** that is on by default. Uses the
-[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `v0.6.0`
+[`cliproxy-provider-kit`](https://github.com/TogetherWeOwn/cliproxy-provider-kit) at `v0.6.1`
 and the real **CLIProxyAPI v8.0.63** C-ABI loader (ABI 1, RPC schema 10). Requires CLIProxyAPI
 **v8.0.63 or newer**: the kit refuses hosts older than RPC schema 10.
 
@@ -104,7 +104,7 @@ call.
 
 ## Models and execution
 
-Model serving runs through the cliproxy-provider-kit `ModelCatalog` (v0.6.0):
+Model serving runs through the cliproxy-provider-kit `ModelCatalog` (v0.6.1):
 the plugin owns a custom `Fetch` (the paginated `models/search` call below)
 and a probe `Validate` hook, and the kit owns the pipeline around them
 (single-flight, durable last-good, namespace application). Every
