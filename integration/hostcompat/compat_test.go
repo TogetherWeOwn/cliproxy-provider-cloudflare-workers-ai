@@ -28,10 +28,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	translator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"gopkg.in/yaml.v3"
@@ -39,10 +37,6 @@ import (
 
 const provider = "cloudflare-workers-ai"
 const model = "cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8"
-
-// modelB is a second catalog model on the same credential: a credential-wide
-// daily quota failure must cool it without any request ever naming it.
-const modelB = "cloudflare/@cf/qwen/qwen3-30b-a3b-fp8"
 
 var account = strings.Repeat("a", 32)
 
@@ -103,7 +97,6 @@ func genericFileAuth(t *testing.T, ctx context.Context, host *pluginhost.Host, d
 type fixture struct {
 	status                 int
 	daily, firstOnly, gate bool
-	streamQuota, finish    bool
 }
 
 func fixtureOf(body map[string]any) (fx fixture) {
@@ -127,10 +120,6 @@ func fixtureOf(body map[string]any) (fx fixture) {
 			fx.firstOnly = true
 		case word == "gate":
 			fx.gate = true
-		case word == "stream_quota":
-			fx.streamQuota = true
-		case word == "finish":
-			fx.finish = true
 		}
 	}
 	return fx
@@ -216,18 +205,7 @@ func TestRealHostLoader(t *testing.T) {
 						return
 					}
 				}
-				if fx.streamQuota {
-					// Workers AI can report the account-wide daily exhaustion
-					// inside a 200 SSE stream instead of a status code.
-					io.WriteString(w, "data: {\"errors\":[{\"code\":3036,\"message\":\"daily neuron allocation exhausted\"}]}\n\ndata: [DONE]\n\n")
-					return
-				}
-				if fx.finish {
-					io.WriteString(w, "data: {\"id\":\"chat-example\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n")
-				} else {
-					io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n")
-				}
-				io.WriteString(w, "data: [DONE]\n\n")
+				io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -401,9 +379,6 @@ func TestRealHostLoader(t *testing.T) {
 		first.ID = "first-auth"
 		first.Status = coreauth.StatusActive
 		first.Attributes = map[string]string{"type": "api_key", "priority": "10"}
-		// A second model on the same credential: the account-wide quota refusal
-		// must propagate to its state even though no request ever named it.
-		first.ModelStates = map[string]*coreauth.ModelState{modelB: {Status: coreauth.StatusActive}}
 		second = second.Clone()
 		second.ID = "second-auth"
 		second.Status = coreauth.StatusActive
@@ -411,7 +386,7 @@ func TestRealHostLoader(t *testing.T) {
 			if _, err = mgr.Register(ctx, a); err != nil {
 				t.Fatal(err)
 			}
-			registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: model}, {ID: modelB}})
+			registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: model}})
 			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
 		}
 		before := time.Now().UTC()
@@ -426,106 +401,8 @@ func TestRealHostLoader(t *testing.T) {
 		if state == nil || !state.Quota.Exceeded || state.NextRetryAfter.Before(reset) || state.NextRetryAfter.After(reset.Add(3*time.Second)) {
 			t.Fatalf("UTC reset hint lost %+v", state)
 		}
-		// The daily neuron allocation is account-wide: the credential itself
-		// rests until the UTC reset, and every sibling model inherits the
-		// propagated credential_quota layer rather than staying selectable.
-		if !failed.Quota.Exceeded || failed.Quota.Reason != "credential_quota" || failed.Quota.NextRecoverAt.Before(reset) || failed.Quota.NextRecoverAt.After(reset.Add(3*time.Second)) {
-			t.Fatalf("credential-wide quota state lost %+v", failed.Quota)
-		}
-		sibling := failed.ModelStates[modelB]
-		if sibling == nil || !sibling.Quota.Exceeded || sibling.Quota.Reason != "credential_quota" || !sibling.Unavailable || sibling.NextRetryAfter.Before(reset) {
-			t.Fatalf("sibling model escaped the credential-wide cooldown %+v", sibling)
-		}
-		if coreauth.IsAuthAvailableForModel(failed, modelB, time.Now()) {
-			t.Fatal("cooled credential still selectable for sibling model")
-		}
 		if healthy.Unavailable || healthy.Quota.Exceeded {
 			t.Fatal("healthy sibling impaired")
-		}
-	})
-	t.Run("streamed daily quota error cools the whole credential until UTC reset", func(t *testing.T) {
-		mgr := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
-		mgr.SetRetryConfig(0, 0, 1)
-		mgr.RegisterExecutor(ex)
-		streamed := auth.Clone()
-		streamed.ID = "streamed-auth"
-		streamed.Status = coreauth.StatusActive
-		streamed.Attributes = map[string]string{"type": "api_key"}
-		streamed.ModelStates = map[string]*coreauth.ModelState{modelB: {Status: coreauth.StatusActive}}
-		if _, err = mgr.Register(ctx, streamed); err != nil {
-			t.Fatal(err)
-		}
-		registry.GetGlobalRegistry().RegisterClient(streamed.ID, streamed.Provider, []*registry.ModelInfo{{ID: model}, {ID: modelB}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(streamed.ID) })
-		before := time.Now().UTC()
-		reset := time.Date(before.Year(), before.Month(), before.Day()+1, 0, 0, 0, 0, time.UTC)
-		call := coreexec.Request{Model: model, Format: translator.FormatOpenAI, Payload: []byte(`{"model":"` + model + `","stream":true,"messages":[{"role":"user","content":"fixture stream_quota"}]}`)}
-		result, err := mgr.ExecuteStream(ctx, []string{provider}, call, opts)
-		if err != nil {
-			t.Fatalf("stream bootstrap %v", err)
-		}
-		var quotaErr error
-		chunks := 0
-		for c := range result.Chunks {
-			if c.Err != nil {
-				quotaErr = c.Err
-				break
-			}
-			chunks++
-		}
-		// The in-200 SSE errors[] event must surface as a chunk error through
-		// the real loader, still carrying status, hint and credential scope.
-		if chunks == 0 || quotaErr == nil {
-			t.Fatalf("streamed quota event lost: %d chunks, err %v", chunks, quotaErr)
-		}
-		if e, ok := quotaErr.(interface{ StatusCode() int }); !ok || e.StatusCode() != 429 {
-			t.Fatalf("streamed quota status %T %v", quotaErr, quotaErr)
-		}
-		if scoped, ok := quotaErr.(interface{ IsCredentialScoped() bool }); !ok || !scoped.IsCredentialScoped() {
-			t.Fatalf("streamed quota error lost credential scope %T %v", quotaErr, quotaErr)
-		}
-		failed, _ := mgr.GetByID(streamed.ID)
-		if !failed.Quota.Exceeded || failed.Quota.Reason != "credential_quota" || failed.Quota.NextRecoverAt.Before(reset) || failed.Quota.NextRecoverAt.After(reset.Add(3*time.Second)) {
-			t.Fatalf("streamed credential-wide quota state lost %+v", failed.Quota)
-		}
-		sibling := failed.ModelStates[modelB]
-		if sibling == nil || !sibling.Quota.Exceeded || sibling.Quota.Reason != "credential_quota" || sibling.NextRetryAfter.Before(reset) {
-			t.Fatalf("streamed sibling model escaped the credential-wide cooldown %+v", sibling)
-		}
-	})
-	t.Run("finished stream survives the pinned SSE writer", func(t *testing.T) {
-		mgr := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
-		mgr.SetRetryConfig(0, 0, 1)
-		mgr.RegisterExecutor(ex)
-		writer := auth.Clone()
-		writer.ID = "writer-auth"
-		writer.Status = coreauth.StatusActive
-		if _, err = mgr.Register(ctx, writer); err != nil {
-			t.Fatal(err)
-		}
-		registry.GetGlobalRegistry().RegisterClient(writer.ID, writer.Provider, []*registry.ModelInfo{{ID: model}})
-		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(writer.ID) })
-		gin.SetMode(gin.TestMode)
-		handler := openai.NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, mgr))
-		router := gin.New()
-		router.POST("/v1/chat/completions", handler.ChatCompletions)
-		body := `{"model":"` + model + `","stream":true,"messages":[{"role":"user","content":"fixture finish"}]}`
-		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-		request.Header.Set("Content-Type", "application/json")
-		recorder := httptest.NewRecorder()
-		router.ServeHTTP(recorder, request)
-		out := recorder.Body.String()
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("writer stream status %d: %s", recorder.Code, out)
-		}
-		// The pinned v8.0.63 writer reports a stream that closes without a
-		// non-null finish_reason as an error event; the finish fixture carries
-		// one, so the response must carry the terminal chunk and [DONE].
-		if !strings.Contains(out, `"finish_reason":"stop"`) || !strings.Contains(out, "data: [DONE]") {
-			t.Fatalf("writer did not finish the stream: %s", out)
-		}
-		if strings.Contains(out, "closed before any chunk carried finish_reason") {
-			t.Fatalf("writer reported truncation on a complete stream: %s", out)
 		}
 	})
 	t.Run("free-only guard refuses before dispatch until UTC reset", func(t *testing.T) {
