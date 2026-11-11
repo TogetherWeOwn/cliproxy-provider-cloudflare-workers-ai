@@ -1,0 +1,48 @@
+# Highest changed-file tier wins; sensitive wins overlaps. Unmatched and new
+# paths are sensitive. Match dotfiles and dot-directories in glob evaluation.
+# Every PR receives QA; sensitive/unclassified changes receive Security then QA.
+# QA verifies the author's risk_tier attestation and may escalate any change.
+#
+# Content always escalates to sensitive regardless of path: new or changed
+# public endpoints or input parsing; auth, authz, sessions, crypto, keys,
+# secrets or credentials; permission checks; tenant isolation or personal
+# data; SQL, schema or migrations; dependencies and lockfiles (including dev
+# dependencies); CI or workflows; weakened assertions, deleted tests or
+# snapshots, or lowered test gates. Low test paths, if added, are additive-only
+# and never exempt test weakening. The map itself is always sensitive.
+version: 1
+default_tier: sensitive
+tiers:
+  low:
+    # License text only; operational documentation stays sensitive.
+    - "LICENSE"
+  ordinary: [] # No runtime module has been audited for this tier.
+  sensitive:
+    # Review policy, ownership, automation and agent instructions.
+    - ".github/**"
+    - "CODEOWNERS"
+    - "**/CODEOWNERS"
+    - "AGENTS.md"
+    - "**/AGENTS.md"
+    - "CLAUDE.md"
+    - "**/CLAUDE.md"
+    - "SKILL.md"
+    - "**/SKILL.md"
+    - ".claude/**"
+    - "**/.claude/**"
+    - "**/skills/**"
+    # Dependencies, build and release tooling, including nested modules.
+    - "go.mod"
+    - "go.sum"
+    - "**/go.mod"
+    - "**/go.sum"
+    - "Makefile"
+    - "**/Makefile"
+    - "Dockerfile*"
+    - "**/Dockerfile*"
+    - "scripts/**"
+    # Plugin runtime, public input, network, credential and quota boundaries;
+    # integration tests and registry metadata are sensitive as well.
+    - "*.go"
+    - "integration/**"
+    - "registry.json"
