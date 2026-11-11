@@ -193,20 +193,21 @@ func TestErrorClassificationForStreamAndNonstream(t *testing.T) {
 		body, code string
 		retry      bool
 		delay      int
+		scoped     bool
 	}{
-		{401, `secret`, "invalid_credentials", false, 0},
-		{403, `{"errors":[{"code":5016}]}`, "entitlement_required", false, 0},
-		{404, `{"errors":[{"code":3042}]}`, "upstream_not_found", false, 0},
-		{400, `{"errors":[{"code":5007}]}`, "upstream_not_found", false, 0},
-		{429, `{"errors":[{"code":3036,"message":"You have used up your daily free allocation of 10,000 neurons."}]}`, "quota_exhausted", true, 60},
-		{429, `{"error":{"message":"daily neuron limit exceeded"}}`, "quota_exhausted", true, 60},
-		{429, `{"errors":[{"code":3040,"message":"Capacity temporarily exceeded, please try again."}]}`, "rate_limit", true, 5},
-		{429, `{"error":"rate limited"}`, "rate_limit", true, 5},
-		{503, `secret`, "upstream_error", true, 0},
-		{408, `secret`, "upstream_error", true, 0},
+		{401, `secret`, "invalid_credentials", false, 0, false},
+		{403, `{"errors":[{"code":5016}]}`, "entitlement_required", false, 0, false},
+		{404, `{"errors":[{"code":3042}]}`, "upstream_not_found", false, 0, false},
+		{400, `{"errors":[{"code":5007}]}`, "upstream_not_found", false, 0, false},
+		{429, `{"errors":[{"code":3036,"message":"You have used up your daily free allocation of 10,000 neurons."}]}`, "quota_exhausted", true, 60, true},
+		{429, `{"error":{"message":"daily neuron limit exceeded"}}`, "quota_exhausted", true, 60, true},
+		{429, `{"errors":[{"code":3040,"message":"Capacity temporarily exceeded, please try again."}]}`, "rate_limit", true, 5, false},
+		{429, `{"error":"rate limited"}`, "rate_limit", true, 5, false},
+		{503, `secret`, "upstream_error", true, 0, false},
+		{408, `secret`, "upstream_error", true, 0, false},
 	} {
 		e := classifyFailure(pluginapi.HTTPResponse{StatusCode: tc.status, Body: []byte(tc.body)}, now)
-		if e.Code != tc.code || e.Retryable != tc.retry || e.RetryAfterSeconds != tc.delay {
+		if e.Code != tc.code || e.Retryable != tc.retry || e.RetryAfterSeconds != tc.delay || e.CredentialScoped != tc.scoped {
 			t.Fatalf("classification %d %s: %+v", tc.status, tc.code, e)
 		}
 		if strings.Contains(e.Message, "secret") {
@@ -221,6 +222,9 @@ func TestErrorClassificationForStreamAndNonstream(t *testing.T) {
 		if !errors.As(a, &ae) || !errors.As(b, &be) || ae.Code != tc.code || be.Code != tc.code || ae.HTTPStatus != be.HTTPStatus {
 			t.Fatalf("inconsistent errors %v %v", a, b)
 		}
+		if ae.CredentialScoped != tc.scoped || be.CredentialScoped != tc.scoped {
+			t.Fatalf("credential scope %d %s: non-stream %v stream %v", tc.status, tc.code, ae.CredentialScoped, be.CredentialScoped)
+		}
 	}
 	for _, tc := range []struct {
 		body, retry string
@@ -230,5 +234,147 @@ func TestErrorClassificationForStreamAndNonstream(t *testing.T) {
 		if e.RetryAfterSeconds != tc.want {
 			t.Fatalf("retry timing %+v", e)
 		}
+	}
+}
+
+// A 200 SSE stream can still carry account-wide neuron exhaustion as an error
+// event; the credential-scoped 429 must reach the host through the stream
+// chunk path, while other events and non-quota error shapes pass through.
+func TestStreamQuotaEventCarriesCredentialScope(t *testing.T) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		io.WriteString(w, "data: {\"errors\":[{\"code\":3036,\"message\":\"You have used up your daily free allocation of 10,000 neurons.\"}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	})))
+	defer server.Close()
+	req := pluginapi.ExecutorRequest{Payload: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8","stream":true}`), StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
+	stream, err := newExecutor(testGuard(server)).ExecuteStream(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first, quotaErr pluginapi.ExecutorStreamChunk
+	select {
+	case first = <-stream.Chunks:
+	case <-time.After(4 * time.Second):
+		t.Fatal("stream did not deliver the data event")
+	}
+	if first.Err != nil || len(first.Payload) == 0 {
+		t.Fatalf("data event became %+v", first)
+	}
+	select {
+	case quotaErr = <-stream.Chunks:
+	case <-time.After(4 * time.Second):
+		t.Fatal("quota event did not become a stream error")
+	}
+	var e *pluginabi.Error
+	if !errors.As(quotaErr.Err, &e) || e.Code != "quota_exhausted" || e.HTTPStatus != 429 {
+		t.Fatalf("stream quota error %+v", quotaErr.Err)
+	}
+	if !e.CredentialScoped || !e.IsCredentialScoped() {
+		t.Fatal("stream quota error lost credential scope")
+	}
+	if e.RetryAfterSeconds <= 0 {
+		t.Fatalf("stream quota error retry-after %d", e.RetryAfterSeconds)
+	}
+	if c, ok := <-stream.Chunks; ok {
+		t.Fatalf("stream continued after quota error %+v", c)
+	}
+}
+
+// Non-quota stream error events are not intercepted: they stay ordinary data
+// so the host keeps its own model-scoped handling, and bare JSON plus [DONE]
+// are never mistaken for errors.
+func TestStreamNonQuotaEventsPassThrough(t *testing.T) {
+	now := time.Date(2030, 1, 1, 23, 59, 0, 0, time.UTC)
+	for _, payload := range []string{
+		`data: {"choices":[{"delta":{"content":"hello"}}]}` + "\n\n",
+		`data: {"choices":[{"delta":{"content":"daily neuron activity"}}]}` + "\n\n",
+		`data: {"errors":[{"code":3040,"message":"Capacity temporarily exceeded"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+		`data: {"error":{"message":"rate limited"}}` + "\n\n",
+		`{"choices":[{"delta":{"content":"bare"}}]}`,
+		`{"choices":[{"delta":{"content":"daily neuron activity"}}]}`,
+		": keep-alive\n\n",
+	} {
+		if e := streamQuotaError([]byte(payload), now); e != nil {
+			t.Fatalf("streamQuotaError(%q) = %+v, want nil", payload, e)
+		}
+	}
+	for _, payload := range []string{
+		`data: {"errors":[{"code":3036,"message":"daily free allocation of neurons used up"}]}` + "\n\n",
+		`{"error":{"message":"daily neuron limit exceeded"}}`,
+	} {
+		e := streamQuotaError([]byte(payload), now)
+		if e == nil || !e.CredentialScoped || e.HTTPStatus != 429 || e.RetryAfterSeconds != 60 {
+			t.Fatalf("streamQuotaError(%q) = %+v", payload, e)
+		}
+	}
+}
+
+// Generated text can legitimately contain the words the quota shape matches,
+// so a stream whose content mentions them must flow to the host untouched:
+// every event arrives as a data chunk and the stream ends normally.
+func TestStreamContentWithQuotaWordsPassesThrough(t *testing.T) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"daily neuron activity\"}}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"more\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	})))
+	defer server.Close()
+	req := pluginapi.ExecutorRequest{Payload: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8","stream":true}`), StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
+	stream, err := newExecutor(testGuard(server)).ExecuteStream(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawPhrase bool
+	timeout := time.After(4 * time.Second)
+	for {
+		select {
+		case c, ok := <-stream.Chunks:
+			if !ok {
+				if !sawPhrase {
+					t.Fatal("content chunk carrying the phrase never arrived")
+				}
+				return
+			}
+			if c.Err != nil {
+				t.Fatalf("content event became a stream error %+v", c.Err)
+			}
+			if strings.Contains(string(c.Payload), "daily neuron") {
+				sawPhrase = true
+			}
+		case <-timeout:
+			t.Fatal("stream stalled")
+		}
+	}
+}
+
+// When the consumer abandons a stream the forwarding goroutine must not wedge
+// on a send: it drops the pending chunk, runs the release, and closes the
+// output channel. Nothing reads the output until the release has fired, so a
+// send can never be ready — a bare `out <- c` would deadlock and hit the
+// timeout instead of passing.
+func TestClassifyStreamEventsCancelWithoutReader(t *testing.T) {
+	in := make(chan pluginapi.ExecutorStreamChunk, 2)
+	in <- pluginapi.ExecutorStreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"x"}}]}`)}
+	in <- pluginapi.ExecutorStreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"y"}}]}`)}
+	released := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already abandoned before forwarding starts
+	out := classifyStreamEvents(ctx, in, func() { close(released) })
+	select {
+	case <-released:
+	case <-time.After(4 * time.Second):
+		t.Fatal("cancelled stream never ran release")
+	}
+	select {
+	case _, ok := <-out:
+		if ok {
+			t.Fatal("cancelled stream delivered a chunk")
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("cancelled stream never closed")
 	}
 }
