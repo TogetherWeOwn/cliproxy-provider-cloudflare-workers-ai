@@ -14,12 +14,8 @@ version: 1
 default_tier: sensitive
 tiers:
   low:
-    # Individually reviewed prose; no broad docs or fixture wildcard.
-    - "README.md"
+    # License text only; operational documentation stays sensitive.
     - "LICENSE"
-    - "docs/MIGRATION.md"
-    - "docs/PROVENANCE.md"
-    - "docs/SOURCES.md"
   ordinary: [] # No runtime module has been audited for this tier.
   sensitive:
     # Review policy, ownership, automation and agent instructions.
