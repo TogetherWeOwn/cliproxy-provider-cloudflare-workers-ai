@@ -48,15 +48,16 @@ func (e executor) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequest
 		cancel()
 		return out, err
 	}
-	out.Chunks = classifyStreamEvents(out.Chunks, cancel)
+	out.Chunks = classifyStreamEvents(streamCtx, out.Chunks, cancel)
 	return out, nil
 }
 
 // classifyStreamEvents forwards stream chunks until an event carries the
 // account-wide quota shape (see streamQuotaError); that event becomes a
 // credential-scoped chunk error and the upstream is released. Any other chunk
-// error already ends the stream, so it just passes through.
-func classifyStreamEvents(in <-chan pluginapi.ExecutorStreamChunk, cancel context.CancelFunc) <-chan pluginapi.ExecutorStreamChunk {
+// error already ends the stream, so it just passes through. Sends select on
+// the stream context so an abandoned stream never blocks the goroutine.
+func classifyStreamEvents(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, cancel context.CancelFunc) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(out)
@@ -64,11 +65,18 @@ func classifyStreamEvents(in <-chan pluginapi.ExecutorStreamChunk, cancel contex
 		for c := range in {
 			if c.Err == nil {
 				if e := streamQuotaError(c.Payload, time.Now()); e != nil {
-					out <- pluginapi.ExecutorStreamChunk{Err: e}
+					select {
+					case out <- pluginapi.ExecutorStreamChunk{Err: e}:
+					case <-ctx.Done():
+					}
 					return
 				}
 			}
-			out <- c
+			select {
+			case out <- c:
+			case <-ctx.Done():
+				return
+			}
 			if c.Err != nil {
 				return
 			}

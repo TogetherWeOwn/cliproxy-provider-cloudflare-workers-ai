@@ -39,7 +39,7 @@ func classifyFailure(resp pluginapi.HTTPResponse, now time.Time) *pluginabi.Erro
 		if hasErrorCode(resp.Body, 3036) || (strings.Contains(body, "daily") && strings.Contains(body, "neuron")) {
 			e.Code, e.Message = "quota_exhausted", "Workers AI daily free neuron allocation exhausted"
 			e.RetryAfterSeconds = int(math.Ceil(nextReset(now).Sub(now).Seconds()))
-			// The daily neuron allocation is accountTag-wide (quota.go:
+			// The daily neuron allocation is account-wide (quota.go:
 			// "Aggregate account-wide"), so the whole credential rests until
 			// the UTC reset instead of cool-only-the-reporting-model.
 			e.CredentialScoped = true
@@ -66,12 +66,13 @@ func classifyFailure(resp pluginapi.HTTPResponse, now time.Time) *pluginabi.Erro
 // streamQuotaError surfaces an account-wide quota refusal embedded in a 200
 // upstream SSE event. Workers AI can signal daily neuron exhaustion inside a
 // streaming response, where the HTTP-status classification above never runs.
-// Only the credential-scoped 3036/daily-neuron shape is intercepted: the event
-// is classified through the same 429 rules so the stream chunk error keeps the
-// scoped flag, and every other event shape returns nil and passes through.
+// Only structured error events are candidates: the daily-neuron substring
+// shape only ever appears inside an errors[]/error field, and ordinary
+// generated text may mention it, so events without such a field — content
+// chunks, [DONE], keep-alives — pass through before the 429 rules run.
 func streamQuotaError(payload []byte, now time.Time) *pluginabi.Error {
 	data := streamDataValue(payload)
-	if data == nil {
+	if data == nil || !hasErrorField(data) {
 		return nil
 	}
 	e := classifyFailure(pluginapi.HTTPResponse{StatusCode: http.StatusTooManyRequests, Body: data}, now)
@@ -112,6 +113,21 @@ func streamDataValue(payload []byte) []byte {
 		return compact.Bytes()
 	}
 	return event
+}
+
+// hasErrorField reports whether the parsed body carries either of the
+// structured error fields (errors[] or error) Workers AI uses. It deliberately
+// accepts a null value: presence of the field is what separates an error event
+// from ordinary stream content.
+func hasErrorField(raw []byte) bool {
+	var wire struct {
+		Errors json.RawMessage `json:"errors"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(raw, &wire) != nil {
+		return false
+	}
+	return wire.Errors != nil || wire.Error != nil
 }
 
 func hasErrorCode(raw []byte, wanted int) bool {

@@ -289,10 +289,12 @@ func TestStreamNonQuotaEventsPassThrough(t *testing.T) {
 	now := time.Date(2030, 1, 1, 23, 59, 0, 0, time.UTC)
 	for _, payload := range []string{
 		`data: {"choices":[{"delta":{"content":"hello"}}]}` + "\n\n",
+		`data: {"choices":[{"delta":{"content":"daily neuron activity"}}]}` + "\n\n",
 		`data: {"errors":[{"code":3040,"message":"Capacity temporarily exceeded"}]}` + "\n\n",
 		"data: [DONE]\n\n",
 		`data: {"error":{"message":"rate limited"}}` + "\n\n",
 		`{"choices":[{"delta":{"content":"bare"}}]}`,
+		`{"choices":[{"delta":{"content":"daily neuron activity"}}]}`,
 		": keep-alive\n\n",
 	} {
 		if e := streamQuotaError([]byte(payload), now); e != nil {
@@ -307,5 +309,70 @@ func TestStreamNonQuotaEventsPassThrough(t *testing.T) {
 		if e == nil || !e.CredentialScoped || e.HTTPStatus != 429 || e.RetryAfterSeconds != 60 {
 			t.Fatalf("streamQuotaError(%q) = %+v", payload, e)
 		}
+	}
+}
+
+// Generated text can legitimately contain the words the quota shape matches,
+// so a stream whose content mentions them must flow to the host untouched:
+// every event arrives as a data chunk and the stream ends normally.
+func TestStreamContentWithQuotaWordsPassesThrough(t *testing.T) {
+	server := httptest.NewServer(withAnalytics(0, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"daily neuron activity\"}}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"more\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	})))
+	defer server.Close()
+	req := pluginapi.ExecutorRequest{Payload: []byte(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct-fp8","stream":true}`), StorageJSON: authJSON(testAccount, "example-key"), HTTPClient: mockHostClient{server}}
+	stream, err := newExecutor(testGuard(server)).ExecuteStream(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawPhrase bool
+	timeout := time.After(4 * time.Second)
+	for {
+		select {
+		case c, ok := <-stream.Chunks:
+			if !ok {
+				if !sawPhrase {
+					t.Fatal("content chunk carrying the phrase never arrived")
+				}
+				return
+			}
+			if c.Err != nil {
+				t.Fatalf("content event became a stream error %+v", c.Err)
+			}
+			if strings.Contains(string(c.Payload), "daily neuron") {
+				sawPhrase = true
+			}
+		case <-timeout:
+			t.Fatal("stream stalled")
+		}
+	}
+}
+
+// When the consumer stops reading a cancelled stream, the forwarding goroutine
+// must not wedge on a send: it drops the pending chunk, runs the release, and
+// closes the output channel.
+func TestClassifyStreamEventsCancelWithoutReader(t *testing.T) {
+	in := make(chan pluginapi.ExecutorStreamChunk, 2)
+	in <- pluginapi.ExecutorStreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"x"}}]}`)}
+	in <- pluginapi.ExecutorStreamChunk{Payload: []byte(`{"choices":[{"delta":{"content":"y"}}]}`)}
+	released := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already abandoned before forwarding starts, so no send can win
+	out := classifyStreamEvents(ctx, in, func() { close(released) })
+	select {
+	case _, ok := <-out:
+		if ok {
+			t.Fatal("cancelled stream delivered a chunk")
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("cancelled stream never closed")
+	}
+	select {
+	case <-released:
+	case <-time.After(4 * time.Second):
+		t.Fatal("cancelled stream never ran release")
 	}
 }
